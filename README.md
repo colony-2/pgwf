@@ -10,21 +10,21 @@ pgwf (Postgres Workflow) is a pure-SQL workflow engine. It's built specifically 
 
 ### Functions
 
-| Function          | Description                                                                                                          | Complete Signature                                                                                                                               |
-|-------------------|----------------------------------------------------------------------------------------------------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------|
-| `pgwf.submit_job` | Inserts a new job, validates dependencies, and (optionally) emits notifications for `next_need`.                     | `submit_job(job_id TEXT, worker_id TEXT, next_need TEXT, wait_for TEXT[], singleton_key TEXT, available_at TIMESTAMPTZ)`                         |
-| `pgwf.get_work`        | Leases up to `limit_jobs` that match the supplied capabilities, assigning a fresh `lease_id` and visibility timeout. | `pgwf.get_work(worker_id TEXT, worker_caps TEXT[], lease_seconds INT, limit_jobs INT)`                                                           |
-| `pgwf.extend_lease`    | Heartbeats an active lease by pushing `lease_expires_at` into the future.                                            | `pgwf.extend_lease(job_id TEXT, lease_id TEXT, worker_id TEXT, additional_seconds INT)`                                                          |
-| `pgwf.reschedule_job`  | Returns a leased job to the queue with updated capability/dependency metadata and clears the lease.                  | `pgwf.reschedule_job(job_id TEXT, lease_id TEXT, worker_id TEXT, next_need TEXT, wait_for TEXT[], singleton_key TEXT, available_at TIMESTAMPTZ)` |
-| `pgwf.complete_job`    | Archives the job, deletes it from `pgwf.jobs`, removes the job_id from dependents, and wakes listeners.              | `pgwf.complete_job(job_id TEXT, lease_id TEXT, worker_id TEXT)`                                                                                  |
+| Function          | Description                                                                                                          | Signature                                                                                                                                   |
+|-------------------|----------------------------------------------------------------------------------------------------------------------|---------------------------------------------------------------------------------------------------------------------------------------------|
+| `submit_job` | Inserts a new job, validates dependencies, and (optionally) emits notifications for `next_need`.                     | `submit_job(job_id TEXT, worker_id TEXT, next_need TEXT, wait_for TEXT[], singleton_key TEXT, available_at TIMESTAMPTZ)`                    |
+| `get_work`        | Leases up to `limit_jobs` that match the supplied capabilities, assigning a fresh `lease_id` and visibility timeout. | `get_work(worker_id TEXT, worker_caps TEXT[], lease_seconds INT, limit_jobs INT)`                                                           |
+| `extend_lease`    | Heartbeats an active lease by pushing `lease_expires_at` into the future.                                            | `extend_lease(job_id TEXT, lease_id TEXT, worker_id TEXT, additional_seconds INT)`                                                          |
+| `reschedule_job`  | Returns a leased job to the queue with updated capability/dependency metadata and clears the lease.                  | `reschedule_job(job_id TEXT, lease_id TEXT, worker_id TEXT, next_need TEXT, wait_for TEXT[], singleton_key TEXT, available_at TIMESTAMPTZ)` |
+| `complete_job`    | Archives the job, deletes it from `pgwf.jobs`, removes the job_id from dependents, and wakes listeners.              | `complete_job(job_id TEXT, lease_id TEXT, worker_id TEXT)`                                                                                  |
 
 ### Backing Tables
 
 | Table | Columns (summary) | Purpose |
 |-------|-------------------|---------|
-| `pgwf.jobs` | `job_id`, `next_need`, `wait_for[]`, `singleton_key`, `available_at`, `lease_id`, `lease_expires_at`, timestamps | Live job metadata for runnable/leased/delayed jobs. |
-| `pgwf.jobs_archive` | `job_id`, `next_need`, `wait_for[]`, `singleton_key`, `created_at`, `lease_id`, `archived_at` | Immutable snapshot for completed jobs; prevents `job_id` reuse. |
-| `pgwf.jobs_trace` | `trace_id`, `job_id`, `event_type`, `worker_id`, `event_at`, `input_data`, `output_data` | Append-only audit log of every workflow call. |
+| `jobs` | `job_id`, `next_need`, `wait_for[]`, `singleton_key`, `available_at`, `lease_id`, `lease_expires_at`, timestamps | Live job metadata for runnable/leased/delayed jobs. |
+| `jobs_archive` | `job_id`, `next_need`, `wait_for[]`, `singleton_key`, `created_at`, `lease_id`, `archived_at` | Immutable snapshot for completed jobs; prevents `job_id` reuse. |
+| `jobs_trace` | `trace_id`, `job_id`, `event_type`, `worker_id`, `event_at`, `input_data`, `output_data` | Append-only audit log of every workflow call. |
 
 ## Inspiration
 
