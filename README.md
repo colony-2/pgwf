@@ -10,13 +10,15 @@ pgwf (Postgres Workflow) is a pure-SQL workflow engine. It's built specifically 
 
 ### Functions
 
-| Function          | Description                                                                                                          | Signature                                                                                                                                   |
-|-------------------|----------------------------------------------------------------------------------------------------------------------|---------------------------------------------------------------------------------------------------------------------------------------------|
-| `submit_job` | Inserts a new job, validates dependencies, and (optionally) emits notifications for `next_need`.                     | `submit_job(job_id TEXT, worker_id TEXT, next_need TEXT, wait_for TEXT[], singleton_key TEXT, available_at TIMESTAMPTZ)`                    |
+| Function          | Description                                                                                                         | Signature                                                                                                                                   |
+|-------------------|---------------------------------------------------------------------------------------------------------------------|---------------------------------------------------------------------------------------------------------------------------------------------|
+| `submit_job` | Inserts a new job, validates dependencies, and (optionally) emits notifications for `next_need`.                    | `submit_job(job_id TEXT, worker_id TEXT, next_need TEXT, wait_for TEXT[], singleton_key TEXT, available_at TIMESTAMPTZ)`                    |
 | `get_work`        | Leases up to `limit_jobs` that match the supplied capabilities, assigning a fresh `lease_id` and visibility timeout. | `get_work(worker_id TEXT, worker_caps TEXT[], lease_seconds INT, limit_jobs INT)`                                                           |
-| `extend_lease`    | Heartbeats an active lease by pushing `lease_expires_at` into the future.                                            | `extend_lease(job_id TEXT, lease_id TEXT, worker_id TEXT, additional_seconds INT)`                                                          |
-| `reschedule_job`  | Returns a leased job to the queue with updated capability/dependency metadata and clears the lease.                  | `reschedule_job(job_id TEXT, lease_id TEXT, worker_id TEXT, next_need TEXT, wait_for TEXT[], singleton_key TEXT, available_at TIMESTAMPTZ)` |
-| `complete_job`    | Archives the job, deletes it from `pgwf.jobs`, removes the job_id from dependents, and wakes listeners.              | `complete_job(job_id TEXT, lease_id TEXT, worker_id TEXT)`                                                                                  |
+| `extend_lease`    | Heartbeats an active lease by pushing `lease_expires_at` into the future.                                           | `extend_lease(job_id TEXT, lease_id TEXT, worker_id TEXT, additional_seconds INT)`                                                          |
+| `reschedule_job`  | Returns a leased job to the queue with updated capability/dependency metadata and clears the lease.                 | `reschedule_job(job_id TEXT, lease_id TEXT, worker_id TEXT, next_need TEXT, wait_for TEXT[], singleton_key TEXT, available_at TIMESTAMPTZ)` |
+| `reschedule_unheld_job` | Mutates any `READY` job’s metadata/availability without first needing a lease.                                       | `reschedule_unheld_job(job_id TEXT, worker_id TEXT, next_need TEXT, wait_for TEXT[], singleton_key TEXT, available_at TIMESTAMPTZ)`         |
+| `complete_job`    | Archives the job, deletes it from `pgwf.jobs`, removes the job_id from dependents, and wakes listeners.             | `complete_job(job_id TEXT, lease_id TEXT, worker_id TEXT)`                                                                                  |
+| `complete_unheld_job` | Archives a `READY` job that never acquired (or no longer holds) a lease, unblocking dependent work.                  | `complete_unheld_job(job_id TEXT, worker_id TEXT)`                                                                                          |
 
 ### Backing Tables
 
@@ -25,6 +27,23 @@ pgwf (Postgres Workflow) is a pure-SQL workflow engine. It's built specifically 
 | `jobs` | `job_id`, `next_need`, `wait_for[]`, `singleton_key`, `available_at`, `lease_id`, `lease_expires_at`, timestamps | Live job metadata for runnable/leased/delayed jobs. |
 | `jobs_archive` | `job_id`, `next_need`, `wait_for[]`, `singleton_key`, `created_at`, `lease_id`, `archived_at` | Immutable snapshot for completed jobs; prevents `job_id` reuse. |
 | `jobs_trace` | `trace_id`, `job_id`, `event_type`, `worker_id`, `event_at`, `input_data`, `output_data` | Append-only audit log of every workflow call. |
+
+### Views
+
+| View | Columns (summary) | Purpose |
+|------|-------------------|---------|
+| `jobs_with_status` | `jobs.*` plus computed `status` (`READY`, `PENDING_JOBS`, `AWAITING_FUTURE`, `ACTIVE`) | Primary locking surface for functions that care about availability + lease state. |
+| `jobs_friendly_status` | `job_id`, `status`, human-oriented columns (`creation_dt`, `pending_jobs`, `sleep_until`, `worker_id`) | Convenience view for monitoring dashboards or ad-hoc inspection. |
+
+#### Job Status Definitions
+
+| Status | Description                                        |
+|--------|----------------------------------------------------|
+| `READY` | Job is available, unleased and ready to be leased. |
+| `PENDING_JOBS` | Job is waiting for dependent jobs to complete.     |
+| `AWAITING_FUTURE` | Job is waiting for a future time to run.           |
+| `ACTIVE` | Job is currently being processed.                  |
+
 
 ## Inspiration
 

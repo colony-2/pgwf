@@ -39,6 +39,27 @@ CREATE TABLE IF NOT EXISTS pgwf.jobs_trace (
     output_data JSONB
 );
 
+CREATE OR REPLACE VIEW pgwf.jobs_with_status AS
+SELECT
+    j.*,
+    CASE
+        WHEN j.lease_expires_at > clock_timestamp() THEN 'ACTIVE'
+        WHEN j.available_at > clock_timestamp() THEN 'AWAITING_FUTURE'
+        WHEN COALESCE(array_length(j.wait_for, 1), 0) > 0 THEN 'PENDING_JOBS'
+        ELSE 'READY'
+    END AS status
+FROM pgwf.jobs j;
+
+CREATE OR REPLACE VIEW pgwf.jobs_friendly_status AS
+SELECT
+    jws.job_id,
+    jws.status,
+    jws.created_at AS creation_dt,
+    CASE WHEN jws.status = 'PENDING_JOBS' THEN jws.wait_for ELSE NULL END AS pending_jobs,
+    CASE WHEN jws.status = 'AWAITING_FUTURE' THEN jws.available_at ELSE NULL END AS sleep_until,
+    CASE WHEN jws.status = 'ACTIVE' THEN jws.lease_id ELSE NULL END AS worker_id
+FROM pgwf.jobs_with_status jws;
+
 CREATE OR REPLACE FUNCTION pgwf.is_trace_enabled()
 RETURNS BOOLEAN
 LANGUAGE sql
@@ -86,6 +107,231 @@ BEGIN
     );
 
     RETURN enabled;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION pgwf._lock_job_for_status(
+    p_job_id TEXT,
+    p_status TEXT,
+    p_expected_lease_id TEXT DEFAULT NULL,
+    p_missing_message TEXT DEFAULT NULL
+)
+RETURNS pgwf.jobs_with_status
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_row pgwf.jobs_with_status%ROWTYPE;
+BEGIN
+    IF p_job_id IS NULL THEN
+        RAISE EXCEPTION 'job_id cannot be NULL';
+    END IF;
+
+    SELECT *
+    INTO v_row
+    FROM pgwf.jobs_with_status
+    WHERE job_id = p_job_id
+      AND status = p_status
+      AND (p_expected_lease_id IS NULL OR lease_id = p_expected_lease_id)
+    FOR UPDATE;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION '%', COALESCE(p_missing_message, format('job %s is not in a valid status (%s requested)', p_job_id, p_status));
+    END IF;
+
+    RETURN v_row;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION pgwf._notify_need(
+    p_next_need TEXT,
+    p_job_id TEXT
+)
+RETURNS VOID
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    IF p_next_need IS NULL OR p_job_id IS NULL THEN
+        RETURN;
+    END IF;
+
+    IF pgwf.is_notify_enabled() THEN
+        PERFORM pg_notify(format('pgwf.need.%s', p_next_need), p_job_id);
+    END IF;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION pgwf._emit_trace_event(
+    p_job_id TEXT,
+    p_event_type TEXT,
+    p_worker_id TEXT,
+    p_input JSONB,
+    p_output JSONB DEFAULT NULL
+)
+RETURNS VOID
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    IF NOT pgwf.is_trace_enabled() THEN
+        RETURN;
+    END IF;
+
+    INSERT INTO pgwf.jobs_trace (job_id, event_type, worker_id, input_data, output_data)
+    VALUES (
+        p_job_id,
+        p_event_type,
+        p_worker_id,
+        COALESCE(p_input, '{}'::JSONB),
+        p_output
+    );
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION pgwf._archive_and_delete_job(
+    p_locked_job pgwf.jobs_with_status
+)
+RETURNS pgwf.jobs_archive
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_archive pgwf.jobs_archive%ROWTYPE;
+BEGIN
+    INSERT INTO pgwf.jobs_archive (job_id, next_need, wait_for, singleton_key, created_at, lease_id)
+    VALUES (
+        p_locked_job.job_id,
+        p_locked_job.next_need,
+        p_locked_job.wait_for,
+        p_locked_job.singleton_key,
+        p_locked_job.created_at,
+        p_locked_job.lease_id
+    )
+    RETURNING * INTO v_archive;
+
+    DELETE FROM pgwf.jobs
+    WHERE job_id = p_locked_job.job_id;
+
+    RETURN v_archive;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION pgwf._update_waiters_for_completion(
+    p_completed_job_id TEXT
+)
+RETURNS TABLE(job_id TEXT, next_need TEXT, became_unblocked BOOLEAN)
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_row RECORD;
+BEGIN
+    FOR v_row IN
+        UPDATE pgwf.jobs j
+        SET wait_for = array_remove(wait_for, p_completed_job_id)
+        WHERE p_completed_job_id = ANY(wait_for)
+        RETURNING j.job_id,
+                  j.next_need,
+                  j.available_at,
+                  (COALESCE(array_length(j.wait_for, 1), 0) = 0) AS now_unblocked
+    LOOP
+        IF v_row.now_unblocked AND v_row.available_at <= clock_timestamp() THEN
+            PERFORM pgwf._notify_need(v_row.next_need, v_row.job_id);
+        END IF;
+
+        job_id := v_row.job_id;
+        next_need := v_row.next_need;
+        became_unblocked := v_row.now_unblocked;
+        RETURN NEXT;
+    END LOOP;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION pgwf._complete_locked_job(
+    p_locked_job pgwf.jobs_with_status,
+    p_worker_id TEXT,
+    p_trace_context JSONB DEFAULT '{}'::JSONB
+)
+RETURNS BOOLEAN
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_archive pgwf.jobs_archive%ROWTYPE;
+BEGIN
+    v_archive := pgwf._archive_and_delete_job(p_locked_job);
+
+    PERFORM pgwf._update_waiters_for_completion(p_locked_job.job_id);
+
+    PERFORM pgwf._emit_trace_event(
+        p_locked_job.job_id,
+        'job_finished',
+        p_worker_id,
+        jsonb_build_object(
+            'job_id', p_locked_job.job_id,
+            'worker_id', p_worker_id
+        ) || COALESCE(p_trace_context, '{}'::JSONB),
+        jsonb_build_object('archived_row', to_jsonb(v_archive))
+    );
+
+    RETURN TRUE;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION pgwf._reschedule_locked_job(
+    p_locked_job pgwf.jobs_with_status,
+    p_worker_id TEXT,
+    p_next_need TEXT,
+    p_wait_for TEXT[] DEFAULT '{}'::TEXT[],
+    p_singleton_key TEXT DEFAULT NULL,
+    p_available_at TIMESTAMPTZ DEFAULT clock_timestamp(),
+    p_trace_context JSONB DEFAULT '{}'::JSONB
+)
+RETURNS TABLE(job_id TEXT, next_need TEXT, wait_for TEXT[], available_at TIMESTAMPTZ)
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_wait_for TEXT[];
+    v_available_at TIMESTAMPTZ := COALESCE(p_available_at, clock_timestamp());
+BEGIN
+    v_wait_for := pgwf.normalize_wait_for(p_wait_for);
+
+    UPDATE pgwf.jobs j
+    SET next_need = p_next_need,
+        wait_for = v_wait_for,
+        singleton_key = p_singleton_key,
+        available_at = v_available_at,
+        lease_id = NULL,
+        lease_expires_at = '-infinity'
+    WHERE j.job_id = p_locked_job.job_id
+    RETURNING j.job_id,
+              j.next_need,
+              j.wait_for,
+              j.available_at
+    INTO job_id, next_need, wait_for, available_at;
+
+    PERFORM pgwf._notify_need(next_need, job_id);
+
+    PERFORM pgwf._emit_trace_event(
+        job_id,
+        'reschedule_job',
+        p_worker_id,
+        jsonb_build_object(
+            'job_id', p_locked_job.job_id,
+            'worker_id', p_worker_id,
+            'previous_next_need', p_locked_job.next_need,
+            'previous_wait_for', p_locked_job.wait_for,
+            'previous_singleton_key', p_locked_job.singleton_key,
+            'previous_available_at', p_locked_job.available_at,
+            'next_need', p_next_need,
+            'wait_for', v_wait_for,
+            'singleton_key', p_singleton_key,
+            'available_at', v_available_at
+        ) || COALESCE(p_trace_context, '{}'::JSONB),
+        jsonb_build_object(
+            'job_id', job_id,
+            'next_need', next_need,
+            'wait_for', wait_for,
+            'available_at', available_at
+        )
+    );
+
+    RETURN NEXT;
 END;
 $$;
 
@@ -151,32 +397,27 @@ BEGIN
     RETURNING pgwf.jobs.job_id, pgwf.jobs.next_need, pgwf.jobs.wait_for, pgwf.jobs.available_at
     INTO job_id, next_need, wait_for, available_at;
 
-    IF pgwf.is_notify_enabled() THEN
-        PERFORM pg_notify(format('pgwf.need.%s', next_need), job_id);
-    END IF;
+    PERFORM pgwf._notify_need(next_need, job_id);
 
-    IF pgwf.is_trace_enabled() THEN
-        INSERT INTO pgwf.jobs_trace (job_id, event_type, worker_id, input_data, output_data)
-        VALUES (
-            p_job_id,
-            'job_submitted',
-            p_worker_id,
-            jsonb_build_object(
-                'job_id', p_job_id,
-                'worker_id', p_worker_id,
-                'next_need', p_next_need,
-                'wait_for', v_wait_for,
-                'singleton_key', p_singleton_key,
-                'available_at', v_effective_available
-            ),
-            jsonb_build_object(
-                'job_id', job_id,
-                'next_need', next_need,
-                'wait_for', wait_for,
-                'available_at', available_at
-            )
-        );
-    END IF;
+    PERFORM pgwf._emit_trace_event(
+        p_job_id,
+        'job_submitted',
+        p_worker_id,
+        jsonb_build_object(
+            'job_id', p_job_id,
+            'worker_id', p_worker_id,
+            'next_need', p_next_need,
+            'wait_for', v_wait_for,
+            'singleton_key', p_singleton_key,
+            'available_at', v_effective_available
+        ),
+        jsonb_build_object(
+            'job_id', job_id,
+            'next_need', next_need,
+            'wait_for', wait_for,
+            'available_at', available_at
+        )
+    );
 
     RETURN NEXT;
 END;
@@ -222,22 +463,19 @@ BEGIN
 
     FOR job_id, lease_id, next_need, singleton_key, wait_for, available_at, lease_expires_at IN
         WITH candidates AS (
-            SELECT j.*
-            FROM pgwf.jobs j
-            WHERE j.available_at <= v_now
-              AND (j.lease_id IS NULL OR j.lease_expires_at <= v_now)
-              AND COALESCE(array_length(j.wait_for, 1), 0) = 0
-              AND j.next_need = ANY(v_caps)
+            SELECT jws.*
+            FROM pgwf.jobs_with_status jws
+            WHERE jws.status = 'READY'
+              AND jws.next_need = ANY(v_caps)
               AND (
-                  j.singleton_key IS NULL OR NOT EXISTS (
+                  jws.singleton_key IS NULL OR NOT EXISTS (
                       SELECT 1
-                      FROM pgwf.jobs other
-                      WHERE other.singleton_key = j.singleton_key
-                        AND other.lease_id IS NOT NULL
-                        AND other.lease_expires_at > v_now
+                      FROM pgwf.jobs_with_status other
+                      WHERE other.singleton_key = jws.singleton_key
+                        AND other.status = 'ACTIVE'
                   )
               )
-            ORDER BY j.created_at ASC
+            ORDER BY jws.created_at ASC
             LIMIT p_limit_jobs
             FOR UPDATE SKIP LOCKED
         )
@@ -251,24 +489,21 @@ BEGIN
     LOOP
         v_count := v_count + 1;
 
-        IF pgwf.is_trace_enabled() THEN
-            INSERT INTO pgwf.jobs_trace (job_id, event_type, worker_id, input_data, output_data)
-            VALUES (
-                job_id,
-                'job_retrieved',
-                p_worker_id,
-                jsonb_build_object(
-                    'worker_id', p_worker_id,
-                    'worker_caps', v_caps,
-                    'lease_seconds', p_lease_seconds,
-                    'limit_jobs', p_limit_jobs
-                ),
-                jsonb_build_object(
-                    'lease_id', lease_id,
-                    'lease_expires_at', lease_expires_at
-                )
-            );
-        END IF;
+        PERFORM pgwf._emit_trace_event(
+            job_id,
+            'job_retrieved',
+            p_worker_id,
+            jsonb_build_object(
+                'worker_id', p_worker_id,
+                'worker_caps', v_caps,
+                'lease_seconds', p_lease_seconds,
+                'limit_jobs', p_limit_jobs
+            ),
+            jsonb_build_object(
+                'lease_id', lease_id,
+                'lease_expires_at', lease_expires_at
+            )
+        );
 
         RETURN NEXT;
     END LOOP;
@@ -292,49 +527,42 @@ RETURNS TIMESTAMPTZ
 LANGUAGE plpgsql
 AS $$
 DECLARE
-    v_current TIMESTAMPTZ;
+    v_job pgwf.jobs_with_status%ROWTYPE;
     v_new TIMESTAMPTZ;
 BEGIN
     IF p_additional_seconds IS NULL OR p_additional_seconds <= 0 THEN
         RAISE EXCEPTION 'additional_seconds must be positive';
     END IF;
 
-    SELECT lease_expires_at INTO v_current
-    FROM pgwf.jobs
-    WHERE job_id = p_job_id AND lease_id = p_lease_id
-    FOR UPDATE;
-
-    IF NOT FOUND THEN
-        RAISE EXCEPTION 'active lease not found for job %', p_job_id;
-    END IF;
-
-    IF v_current <= clock_timestamp() THEN
-        RAISE EXCEPTION 'lease for job % has expired', p_job_id;
-    END IF;
+    SELECT *
+    INTO v_job
+    FROM pgwf._lock_job_for_status(
+        p_job_id,
+        'ACTIVE',
+        p_lease_id,
+        format('active lease not found for job %s', p_job_id)
+    );
 
     v_new := clock_timestamp() + make_interval(secs => p_additional_seconds);
 
     UPDATE pgwf.jobs
     SET lease_expires_at = v_new
-    WHERE job_id = p_job_id AND lease_id = p_lease_id;
+    WHERE job_id = v_job.job_id AND lease_id = v_job.lease_id;
 
-    IF pgwf.is_trace_enabled() THEN
-        INSERT INTO pgwf.jobs_trace (job_id, event_type, worker_id, input_data, output_data)
-        VALUES (
-            p_job_id,
-            'lease_extended',
-            p_worker_id,
-            jsonb_build_object(
-                'job_id', p_job_id,
-                'lease_id', p_lease_id,
-                'additional_seconds', p_additional_seconds
-            ),
-            jsonb_build_object(
-                'previous_expires_at', v_current,
-                'new_expires_at', v_new
-            )
-        );
-    END IF;
+    PERFORM pgwf._emit_trace_event(
+        p_job_id,
+        'lease_extended',
+        p_worker_id,
+        jsonb_build_object(
+            'job_id', p_job_id,
+            'lease_id', p_lease_id,
+            'additional_seconds', p_additional_seconds
+        ),
+        jsonb_build_object(
+            'previous_expires_at', v_job.lease_expires_at,
+            'new_expires_at', v_new
+        )
+    );
 
     RETURN v_new;
 END;
@@ -353,59 +581,27 @@ RETURNS TABLE(job_id TEXT, next_need TEXT, wait_for TEXT[], available_at TIMESTA
 LANGUAGE plpgsql
 AS $$
 DECLARE
-    v_wait_for TEXT[];
-    v_available_at TIMESTAMPTZ := COALESCE(p_available_at, clock_timestamp());
+    v_job pgwf.jobs_with_status%ROWTYPE;
 BEGIN
-    v_wait_for := pgwf.normalize_wait_for(p_wait_for);
+    SELECT * INTO v_job
+    FROM pgwf._lock_job_for_status(
+        p_job_id,
+        'ACTIVE',
+        p_lease_id,
+        format('job %s is not currently leased with lease %s', p_job_id, p_lease_id)
+    );
 
-    PERFORM 1
-    FROM pgwf.jobs j
-    WHERE j.job_id = p_job_id AND j.lease_id = p_lease_id AND j.lease_expires_at > clock_timestamp()
-    FOR UPDATE;
-
-    IF NOT FOUND THEN
-        RAISE EXCEPTION 'job % is not currently leased with lease %', p_job_id, p_lease_id;
-    END IF;
-
-    UPDATE pgwf.jobs
-    SET next_need = p_next_need,
-        wait_for = v_wait_for,
-        singleton_key = p_singleton_key,
-        available_at = v_available_at,
-        lease_id = NULL,
-        lease_expires_at = '-infinity'
-    WHERE pgwf.jobs.job_id = p_job_id
-    RETURNING pgwf.jobs.job_id, pgwf.jobs.next_need, pgwf.jobs.wait_for, pgwf.jobs.available_at
-    INTO job_id, next_need, wait_for, available_at;
-
-    IF pgwf.is_notify_enabled() THEN
-        PERFORM pg_notify(format('pgwf.need.%s', next_need), job_id);
-    END IF;
-
-    IF pgwf.is_trace_enabled() THEN
-        INSERT INTO pgwf.jobs_trace (job_id, event_type, worker_id, input_data, output_data)
-        VALUES (
-            p_job_id,
-            'reschedule_job',
-            p_worker_id,
-            jsonb_build_object(
-                'job_id', p_job_id,
-                'lease_id', p_lease_id,
-                'next_need', p_next_need,
-                'wait_for', v_wait_for,
-                'singleton_key', p_singleton_key,
-                'available_at', v_available_at
-            ),
-            jsonb_build_object(
-                'job_id', job_id,
-                'next_need', next_need,
-                'wait_for', wait_for,
-                'available_at', available_at
-            )
-        );
-    END IF;
-
-    RETURN NEXT;
+    RETURN QUERY
+    SELECT *
+    FROM pgwf._reschedule_locked_job(
+        v_job,
+        p_worker_id,
+        p_next_need,
+        p_wait_for,
+        p_singleton_key,
+        p_available_at,
+        jsonb_build_object('lease_id', p_lease_id)
+    );
 END;
 $$;
 
@@ -418,53 +614,84 @@ RETURNS BOOLEAN
 LANGUAGE plpgsql
 AS $$
 DECLARE
-    v_job pgwf.jobs%ROWTYPE;
-    v_archive pgwf.jobs_archive%ROWTYPE;
-    v_row RECORD;
+    v_job pgwf.jobs_with_status%ROWTYPE;
 BEGIN
-    SELECT * INTO v_job
-    FROM pgwf.jobs
-    WHERE job_id = p_job_id AND lease_id = p_lease_id AND lease_expires_at > clock_timestamp()
-    FOR UPDATE;
+    v_job := pgwf._lock_job_for_status(
+        p_job_id,
+        'ACTIVE',
+        p_lease_id,
+        format('job %s is not actively leased by %s', p_job_id, p_lease_id)
+    );
 
-    IF NOT FOUND THEN
-        RAISE EXCEPTION 'job % is not actively leased by %', p_job_id, p_lease_id;
-    END IF;
+    RETURN pgwf._complete_locked_job(
+        v_job,
+        p_worker_id,
+        jsonb_build_object('lease_id', p_lease_id)
+    );
+END;
+$$;
 
-    INSERT INTO pgwf.jobs_archive (job_id, next_need, wait_for, singleton_key, created_at, lease_id)
-    VALUES (v_job.job_id, v_job.next_need, v_job.wait_for, v_job.singleton_key, v_job.created_at, v_job.lease_id)
-    RETURNING * INTO v_archive;
+CREATE OR REPLACE FUNCTION pgwf.complete_unheld_job(
+    p_job_id TEXT,
+    p_worker_id TEXT
+)
+RETURNS BOOLEAN
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_job pgwf.jobs_with_status%ROWTYPE;
+BEGIN
+    SELECT *
+    INTO v_job
+    FROM pgwf._lock_job_for_status(
+        p_job_id,
+        'READY',
+        NULL,
+        format('job %s is not available to complete', p_job_id)
+    );
 
-    DELETE FROM pgwf.jobs WHERE job_id = v_job.job_id AND lease_id = v_job.lease_id;
+    RETURN pgwf._complete_locked_job(
+        v_job,
+        p_worker_id,
+        jsonb_build_object('completed_without_lease', TRUE)
+    );
+END;
+$$;
 
-    FOR v_row IN
-        UPDATE pgwf.jobs
-        SET wait_for = array_remove(wait_for, v_job.job_id)
-        WHERE v_job.job_id = ANY(wait_for)
-        RETURNING job_id, next_need, available_at, (COALESCE(array_length(wait_for, 1), 0) = 0) AS now_unblocked
-    LOOP
-        IF v_row.now_unblocked AND v_row.available_at <= clock_timestamp() THEN
-            IF pgwf.is_notify_enabled() THEN
-                PERFORM pg_notify(format('pgwf.need.%s', v_row.next_need), v_row.job_id);
-            END IF;
-        END IF;
-    END LOOP;
+CREATE OR REPLACE FUNCTION pgwf.reschedule_unheld_job(
+    p_job_id TEXT,
+    p_worker_id TEXT,
+    p_next_need TEXT,
+    p_wait_for TEXT[] DEFAULT '{}'::TEXT[],
+    p_singleton_key TEXT DEFAULT NULL,
+    p_available_at TIMESTAMPTZ DEFAULT clock_timestamp()
+)
+RETURNS TABLE(job_id TEXT, next_need TEXT, wait_for TEXT[], available_at TIMESTAMPTZ)
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_job pgwf.jobs_with_status%ROWTYPE;
+BEGIN
+    SELECT *
+    INTO v_job
+    FROM pgwf._lock_job_for_status(
+        p_job_id,
+        'READY',
+        NULL,
+        format('job %s is not available to reschedule', p_job_id)
+    );
 
-    IF pgwf.is_trace_enabled() THEN
-        INSERT INTO pgwf.jobs_trace (job_id, event_type, worker_id, input_data, output_data)
-        VALUES (
-            p_job_id,
-            'job_finished',
-            p_worker_id,
-            jsonb_build_object(
-                'job_id', p_job_id,
-                'lease_id', p_lease_id
-            ),
-            jsonb_build_object('archived_row', to_jsonb(v_archive))
-        );
-    END IF;
-
-    RETURN TRUE;
+    RETURN QUERY
+    SELECT *
+    FROM pgwf._reschedule_locked_job(
+        v_job,
+        p_worker_id,
+        p_next_need,
+        p_wait_for,
+        p_singleton_key,
+        p_available_at,
+        jsonb_build_object('rescheduled_without_lease', TRUE)
+    );
 END;
 $$;
 
