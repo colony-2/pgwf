@@ -239,6 +239,32 @@ func TestDependencyRelease(t *testing.T) {
 	}
 }
 
+func TestCancelJobPreventsFutureWork(t *testing.T) {
+	resetTables(t)
+
+	if _, err := testDB.Exec(`SELECT pgwf.submit_job($1, $2, $3)`, "job-cancel", "submitter", "cap.cancel"); err != nil {
+		t.Fatalf("submit job-cancel: %v", err)
+	}
+	if _, err := testDB.Exec(`SELECT pgwf.cancel_job($1, $2, $3)`, "job-cancel", "operator", "test"); err != nil {
+		t.Fatalf("cancel job-cancel: %v", err)
+	}
+
+	var status string
+	if err := testDB.QueryRow(`SELECT status FROM pgwf.jobs_with_status WHERE job_id = $1`, "job-cancel").Scan(&status); err != nil {
+		t.Fatalf("query status: %v", err)
+	}
+	if status != "CANCELLED" {
+		t.Fatalf("expected CANCELLED status, got %s", status)
+	}
+
+	expectNoWork(t, []string{"cap.cancel"})
+
+	_, err := testDB.Exec(`SELECT pgwf.reschedule_unheld_job($1, $2, $3)`, "job-cancel", "operator", "cap.other")
+	if err == nil || (!strings.Contains(err.Error(), "cancelled") && !strings.Contains(err.Error(), "not available")) {
+		t.Fatalf("expected cancellation/availability error from reschedule_unheld_job, got %v", err)
+	}
+}
+
 func TestExtendLeaseAndReschedule(t *testing.T) {
 	resetTables(t)
 
@@ -273,6 +299,48 @@ func TestExtendLeaseAndReschedule(t *testing.T) {
 	jobID2, _ := leaseSingleJob(t, []string{"cap.delta"})
 	if jobID2 != "job-resched" {
 		t.Fatalf("expected rescheduled job to lease again, got %s", jobID2)
+	}
+}
+
+func TestCancelActiveJobBlocksExtensions(t *testing.T) {
+	resetTables(t)
+
+	if _, err := testDB.Exec(`SELECT pgwf.submit_job($1, $2, $3)`, "job-active-cancel", "submitter", "cap.cancel.active"); err != nil {
+		t.Fatalf("submit job: %v", err)
+	}
+
+	rows, err := testDB.Query(
+		`SELECT job_id, lease_id FROM pgwf.get_work($1, $2, $3, $4)`,
+		"worker-active", pqStringArray([]string{"cap.cancel.active"}), 30, 1,
+	)
+	if err != nil {
+		t.Fatalf("get_work job-active-cancel: %v", err)
+	}
+	defer rows.Close()
+	if !rows.Next() {
+		t.Fatalf("expected lease row")
+	}
+	var jobID, leaseID string
+	if err := rows.Scan(&jobID, &leaseID); err != nil {
+		t.Fatalf("scan lease: %v", err)
+	}
+
+	if _, err := testDB.Exec(`SELECT pgwf.cancel_job($1, $2, $3)`, jobID, "operator-active", "active cancellation"); err != nil {
+		t.Fatalf("cancel active job: %v", err)
+	}
+
+	_, err = testDB.Exec(`SELECT pgwf.extend_lease($1, $2, $3, $4)`, jobID, leaseID, "worker-active", 30)
+	if err == nil || !strings.Contains(err.Error(), "cancelled") {
+		t.Fatalf("expected extend_lease cancellation error, got %v", err)
+	}
+
+	var dummy string
+	err = testDB.QueryRow(
+		`SELECT job_id FROM pgwf.reschedule_job($1, $2, $3, $4)`,
+		jobID, leaseID, "worker-active", "cap.cancel.active",
+	).Scan(&dummy)
+	if err == nil || !strings.Contains(err.Error(), "cancelled") {
+		t.Fatalf("expected reschedule cancellation error, got %v", err)
 	}
 }
 
@@ -427,6 +495,90 @@ func TestCompletionArchivesJob(t *testing.T) {
 	expectErrorContains(t, err, "already completed")
 }
 
+func TestArchiveCancelledJobs(t *testing.T) {
+	resetTables(t)
+
+	if _, err := testDB.Exec(`SELECT pgwf.submit_job($1, $2, $3)`, "cancel-1", "submitter", "cap.cancel.archive"); err != nil {
+		t.Fatalf("submit cancel-1: %v", err)
+	}
+	waitDeps := pqStringArray([]string{"cancel-1"})
+	if _, err := testDB.Exec(`SELECT pgwf.submit_job($1, $2, $3, $4)`, "dependent", "submitter", "cap.dependent", waitDeps); err != nil {
+		t.Fatalf("submit dependent: %v", err)
+	}
+	if _, err := testDB.Exec(`SELECT pgwf.submit_job($1, $2, $3)`, "cancel-2", "submitter", "cap.cancel.other"); err != nil {
+		t.Fatalf("submit cancel-2: %v", err)
+	}
+
+	if _, err := testDB.Exec(`SELECT pgwf.cancel_job($1, $2, $3)`, "cancel-1", "operator", "archive test"); err != nil {
+		t.Fatalf("cancel cancel-1: %v", err)
+	}
+	if _, err := testDB.Exec(`SELECT pgwf.cancel_job($1, $2, $3)`, "cancel-2", "operator", "archive test"); err != nil {
+		t.Fatalf("cancel cancel-2: %v", err)
+	}
+
+	var archived int
+	if err := testDB.QueryRow(`SELECT pgwf.archive_cancelled_jobs($1, $2)`, "sweeper", 10).Scan(&archived); err != nil {
+		t.Fatalf("archive_cancelled_jobs: %v", err)
+	}
+	if archived != 2 {
+		t.Fatalf("expected to archive 2 jobs, got %d", archived)
+	}
+
+	if hasRow(t, `SELECT 1 FROM pgwf.jobs WHERE job_id = ANY($1)`, pqStringArray([]string{"cancel-1", "cancel-2"})) {
+		t.Fatalf("cancelled jobs should be removed from live table")
+	}
+
+	var cancelledArchiveRows int
+	if err := testDB.QueryRow(
+		`SELECT count(*) FROM pgwf.jobs_archive WHERE job_id = ANY($1) AND cancel_requested`,
+		pqStringArray([]string{"cancel-1", "cancel-2"}),
+	).Scan(&cancelledArchiveRows); err != nil {
+		t.Fatalf("count archived rows: %v", err)
+	}
+	if cancelledArchiveRows != 2 {
+		t.Fatalf("expected archived rows to record cancellation, got %d", cancelledArchiveRows)
+	}
+
+	var depWait pqStringArray
+	if err := testDB.QueryRow(`SELECT wait_for FROM pgwf.jobs WHERE job_id = 'dependent'`).Scan(&depWait); err != nil {
+		t.Fatalf("query dependent wait_for: %v", err)
+	}
+	if len(depWait) != 0 {
+		t.Fatalf("dependent wait_for should be cleared, got %v", depWait)
+	}
+
+	var perJobTraceCount int
+	if err := testDB.QueryRow(`SELECT count(*) FROM pgwf.jobs_trace WHERE event_type = 'job_cancel_archived' AND worker_id = $1`, "sweeper").Scan(&perJobTraceCount); err != nil {
+		t.Fatalf("count per-job traces: %v", err)
+	}
+	if perJobTraceCount != 2 {
+		t.Fatalf("expected 2 job_cancel_archived traces, got %d", perJobTraceCount)
+	}
+
+	var runTraceCountBefore int
+	if err := testDB.QueryRow(`SELECT count(*) FROM pgwf.jobs_trace WHERE event_type = 'job_cancel_archived_run'`).Scan(&runTraceCountBefore); err != nil {
+		t.Fatalf("count run traces: %v", err)
+	}
+	if runTraceCountBefore != 1 {
+		t.Fatalf("expected single run trace after archiving, got %d", runTraceCountBefore)
+	}
+
+	if err := testDB.QueryRow(`SELECT pgwf.archive_cancelled_jobs($1, $2)`, "sweeper", 10).Scan(&archived); err != nil {
+		t.Fatalf("second archive_cancelled_jobs: %v", err)
+	}
+	if archived != 0 {
+		t.Fatalf("expected 0 archived rows on second run, got %d", archived)
+	}
+
+	var runTraceCountAfter int
+	if err := testDB.QueryRow(`SELECT count(*) FROM pgwf.jobs_trace WHERE event_type = 'job_cancel_archived_run'`).Scan(&runTraceCountAfter); err != nil {
+		t.Fatalf("count run traces after: %v", err)
+	}
+	if runTraceCountAfter != runTraceCountBefore {
+		t.Fatalf("expected no new run trace when nothing archived, got %d before %d after", runTraceCountBefore, runTraceCountAfter)
+	}
+}
+
 func TestNotifyToggle(t *testing.T) {
 	resetTables(t)
 	setNotify(t, false)
@@ -455,6 +607,43 @@ func TestNotifyToggle(t *testing.T) {
 	}
 	if waitForNotification(listener, 300*time.Millisecond) {
 		t.Fatalf("expected no notification when notify disabled")
+	}
+}
+
+func TestCancelPendingJobSuppressesNotify(t *testing.T) {
+	resetTables(t)
+	setNotify(t, true)
+	t.Cleanup(func() { setNotify(t, false) })
+
+	listener := newNotifyListener(t, "pgwf.need.cap.pending.cancel")
+	defer listener.Close()
+	drainNotifications(listener)
+
+	if _, err := testDB.Exec(`SELECT pgwf.submit_job($1, $2, $3)`, "blocker-cancel", "submitter", "cap.blocker.cancel"); err != nil {
+		t.Fatalf("submit blocker: %v", err)
+	}
+	waitDeps := pqStringArray([]string{"blocker-cancel"})
+	if _, err := testDB.Exec(
+		`SELECT pgwf.submit_job($1, $2, $3, $4)`,
+		"pending-cancel", "submitter", "cap.pending.cancel", waitDeps,
+	); err != nil {
+		t.Fatalf("submit pending job: %v", err)
+	}
+	if _, err := testDB.Exec(`SELECT pgwf.cancel_job($1, $2, $3)`, "pending-cancel", "operator", "cancel pending"); err != nil {
+		t.Fatalf("cancel pending job: %v", err)
+	}
+	drainNotifications(listener)
+
+	blockerJob, blockerLease := leaseSingleJob(t, []string{"cap.blocker.cancel"})
+	if blockerJob != "blocker-cancel" {
+		t.Fatalf("expected blocker-cancel, got %s", blockerJob)
+	}
+	if _, err := testDB.Exec(`SELECT pgwf.complete_job($1, $2, $3)`, blockerJob, blockerLease, "worker-blocker"); err != nil {
+		t.Fatalf("complete blocker: %v", err)
+	}
+
+	if waitForNotification(listener, 300*time.Millisecond) {
+		t.Fatalf("expected no notification for cancelled pending job")
 	}
 }
 
@@ -546,7 +735,14 @@ func TestJobsStatusViews(t *testing.T) {
 		t.Fatalf("expected job-active lease, got %s", activeJob)
 	}
 
-	targetIDs := []string{"job-active", "job-future", "job-pending", "job-ready"}
+	if _, err := testDB.Exec(`SELECT pgwf.submit_job($1, $2, $3)`, "job-cancelled", "submitter", "cap.cancelled"); err != nil {
+		t.Fatalf("submit job-cancelled: %v", err)
+	}
+	if _, err := testDB.Exec(`SELECT pgwf.cancel_job($1, $2, $3)`, "job-cancelled", "operator", "view test"); err != nil {
+		t.Fatalf("cancel job-cancelled: %v", err)
+	}
+
+	targetIDs := []string{"job-active", "job-future", "job-pending", "job-ready", "job-cancelled"}
 	rows, err := testDB.Query(`SELECT job_id, status FROM pgwf.jobs_with_status WHERE job_id = ANY($1)`, pqStringArray(targetIDs))
 	if err != nil {
 		t.Fatalf("query jobs_with_status: %v", err)
@@ -570,6 +766,7 @@ func TestJobsStatusViews(t *testing.T) {
 		"job-future":  "AWAITING_FUTURE",
 		"job-pending": "PENDING_JOBS",
 		"job-ready":   "READY",
+		"job-cancelled": "CANCELLED",
 	}
 	for jobID, want := range wantStatus {
 		got, ok := seen[jobID]
@@ -582,18 +779,21 @@ func TestJobsStatusViews(t *testing.T) {
 	}
 
 	type friendlyExpect struct {
-		status  string
-		worker  string
-		sleep   *time.Time
-		pending []string
+		status      string
+		worker      string
+		sleep       *time.Time
+		pending     []string
+		cancelled   bool
+		cancelledBy string
 	}
 
 	futurePtr := futureTime
 	expectFriendly := map[string]friendlyExpect{
-		"job-active":  {status: "ACTIVE", worker: activeLease},
-		"job-future":  {status: "AWAITING_FUTURE", sleep: &futurePtr},
-		"job-pending": {status: "PENDING_JOBS", pending: []string{"job-blocker"}},
-		"job-ready":   {status: "READY"},
+		"job-active":    {status: "ACTIVE", worker: activeLease},
+		"job-future":    {status: "AWAITING_FUTURE", sleep: &futurePtr},
+		"job-pending":   {status: "PENDING_JOBS", pending: []string{"job-blocker"}},
+		"job-ready":     {status: "READY"},
+		"job-cancelled": {status: "CANCELLED", cancelled: true, cancelledBy: "operator"},
 	}
 
 	for jobID, exp := range expectFriendly {
@@ -603,12 +803,14 @@ func TestJobsStatusViews(t *testing.T) {
 			pending  pqStringArray
 			sleep    sql.NullTime
 			worker   sql.NullString
+			cancelAt sql.NullTime
+			cancelBy sql.NullString
 		)
 
 		err := testDB.QueryRow(
-			`SELECT status, creation_dt, pending_jobs, sleep_until, worker_id FROM pgwf.jobs_friendly_status WHERE job_id = $1`,
+			`SELECT status, creation_dt, pending_jobs, sleep_until, worker_id, cancelled_at, cancelled_by FROM pgwf.jobs_friendly_status WHERE job_id = $1`,
 			jobID,
-		).Scan(&status, &creation, &pending, &sleep, &worker)
+		).Scan(&status, &creation, &pending, &sleep, &worker, &cancelAt, &cancelBy)
 		if err != nil {
 			t.Fatalf("query friendly row for %s: %v", jobID, err)
 		}
@@ -646,6 +848,21 @@ func TestJobsStatusViews(t *testing.T) {
 			}
 		} else if pending != nil {
 			t.Fatalf("expected pending_jobs NULL for %s, got %v", jobID, pending)
+		}
+		if exp.cancelled {
+			if !cancelAt.Valid {
+				t.Fatalf("expected cancelled_at for %s", jobID)
+			}
+			if !cancelBy.Valid || cancelBy.String != exp.cancelledBy {
+				t.Fatalf("expected cancelled_by %s for %s, got %+v", exp.cancelledBy, jobID, cancelBy)
+			}
+		} else {
+			if cancelAt.Valid {
+				t.Fatalf("expected cancelled_at NULL for %s, got %v", jobID, cancelAt.Time)
+			}
+			if cancelBy.Valid {
+				t.Fatalf("expected cancelled_by NULL for %s, got %s", jobID, cancelBy.String)
+			}
 		}
 	}
 }

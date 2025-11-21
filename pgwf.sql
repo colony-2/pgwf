@@ -6,6 +6,16 @@ SET search_path = pgwf, public;
 
 CREATE EXTENSION IF NOT EXISTS pgcrypto;
 
+DO $pgwf$
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_catalog.pg_available_extensions WHERE name = 'pg_cron') THEN
+        EXECUTE 'CREATE EXTENSION IF NOT EXISTS pg_cron';
+    ELSE
+        RAISE NOTICE 'pg_cron extension not available; skipping automatic cancellation archival';
+    END IF;
+END;
+$pgwf$;
+
 CREATE SEQUENCE IF NOT EXISTS pgwf.jobs_trace_id_seq;
 
 CREATE TABLE IF NOT EXISTS pgwf.jobs (
@@ -16,7 +26,10 @@ CREATE TABLE IF NOT EXISTS pgwf.jobs (
     available_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
     lease_id TEXT,
     lease_expires_at TIMESTAMPTZ NOT NULL DEFAULT '-infinity',
-    created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
+    created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+    cancel_requested BOOLEAN NOT NULL DEFAULT FALSE,
+    cancel_requested_by TEXT,
+    cancel_requested_at TIMESTAMPTZ
 );
 
 CREATE TABLE IF NOT EXISTS pgwf.jobs_archive (
@@ -26,7 +39,10 @@ CREATE TABLE IF NOT EXISTS pgwf.jobs_archive (
     wait_for TEXT[] NOT NULL DEFAULT '{}'::TEXT[],
     singleton_key TEXT,
     created_at TIMESTAMPTZ NOT NULL,
-    lease_id TEXT
+    lease_id TEXT,
+    cancel_requested BOOLEAN NOT NULL DEFAULT FALSE,
+    cancel_requested_by TEXT,
+    cancel_requested_at TIMESTAMPTZ
 );
 
 CREATE TABLE IF NOT EXISTS pgwf.jobs_trace (
@@ -44,6 +60,7 @@ SELECT
     j.*,
     CASE
         WHEN j.lease_expires_at > clock_timestamp() THEN 'ACTIVE'
+        WHEN j.cancel_requested THEN 'CANCELLED'
         WHEN j.available_at > clock_timestamp() THEN 'AWAITING_FUTURE'
         WHEN COALESCE(array_length(j.wait_for, 1), 0) > 0 THEN 'PENDING_JOBS'
         ELSE 'READY'
@@ -57,7 +74,9 @@ SELECT
     jws.created_at AS creation_dt,
     CASE WHEN jws.status = 'PENDING_JOBS' THEN jws.wait_for ELSE NULL END AS pending_jobs,
     CASE WHEN jws.status = 'AWAITING_FUTURE' THEN jws.available_at ELSE NULL END AS sleep_until,
-    CASE WHEN jws.status = 'ACTIVE' THEN jws.lease_id ELSE NULL END AS worker_id
+    CASE WHEN jws.status = 'ACTIVE' THEN jws.lease_id ELSE NULL END AS worker_id,
+    CASE WHEN jws.status = 'CANCELLED' THEN jws.cancel_requested_at ELSE NULL END AS cancelled_at,
+    CASE WHEN jws.status = 'CANCELLED' THEN jws.cancel_requested_by ELSE NULL END AS cancelled_by
 FROM pgwf.jobs_with_status jws;
 
 CREATE OR REPLACE FUNCTION pgwf.is_trace_enabled()
@@ -195,14 +214,27 @@ AS $$
 DECLARE
     v_archive pgwf.jobs_archive%ROWTYPE;
 BEGIN
-    INSERT INTO pgwf.jobs_archive (job_id, next_need, wait_for, singleton_key, created_at, lease_id)
+    INSERT INTO pgwf.jobs_archive (
+        job_id,
+        next_need,
+        wait_for,
+        singleton_key,
+        created_at,
+        lease_id,
+        cancel_requested,
+        cancel_requested_by,
+        cancel_requested_at
+    )
     VALUES (
         p_locked_job.job_id,
         p_locked_job.next_need,
         p_locked_job.wait_for,
         p_locked_job.singleton_key,
         p_locked_job.created_at,
-        p_locked_job.lease_id
+        p_locked_job.lease_id,
+        p_locked_job.cancel_requested,
+        p_locked_job.cancel_requested_by,
+        p_locked_job.cancel_requested_at
     )
     RETURNING * INTO v_archive;
 
@@ -213,25 +245,54 @@ BEGIN
 END;
 $$;
 
-CREATE OR REPLACE FUNCTION pgwf._update_waiters_for_completion(
-    p_completed_job_id TEXT
+CREATE OR REPLACE FUNCTION pgwf._update_waiters_for_completion_bulk(
+    p_completed_jobs TEXT[]
 )
 RETURNS TABLE(job_id TEXT, next_need TEXT, became_unblocked BOOLEAN)
 LANGUAGE plpgsql
 AS $$
 DECLARE
     v_row RECORD;
+    v_now TIMESTAMPTZ := clock_timestamp();
 BEGIN
+    IF p_completed_jobs IS NULL OR array_length(p_completed_jobs, 1) IS NULL OR array_length(p_completed_jobs, 1) = 0 THEN
+        RETURN;
+    END IF;
+
     FOR v_row IN
-        UPDATE pgwf.jobs j
-        SET wait_for = array_remove(wait_for, p_completed_job_id)
-        WHERE p_completed_job_id = ANY(wait_for)
-        RETURNING j.job_id,
-                  j.next_need,
-                  j.available_at,
-                  (COALESCE(array_length(j.wait_for, 1), 0) = 0) AS now_unblocked
+        WITH targets AS (
+            SELECT j.*
+            FROM pgwf.jobs j
+            WHERE EXISTS (
+                SELECT 1
+                FROM unnest(j.wait_for) pending(job_id)
+                WHERE pending.job_id = ANY(p_completed_jobs)
+            )
+            FOR UPDATE
+        ),
+        updated AS (
+            UPDATE pgwf.jobs j
+            SET wait_for = (
+                SELECT COALESCE(array_agg(val ORDER BY ord), ARRAY[]::TEXT[])
+                FROM unnest(j.wait_for) WITH ORDINALITY AS pending(val, ord)
+                WHERE pending.val IS NOT NULL
+                  AND NOT (pending.val = ANY(p_completed_jobs))
+            )
+            FROM targets t
+            WHERE j.job_id = t.job_id
+            RETURNING
+                j.job_id,
+                j.next_need,
+                j.available_at,
+                (COALESCE(array_length(j.wait_for, 1), 0) = 0) AS now_unblocked,
+                j.cancel_requested
+        )
+        SELECT *
+        FROM updated
     LOOP
-        IF v_row.now_unblocked AND v_row.available_at <= clock_timestamp() THEN
+        IF v_row.now_unblocked
+           AND v_row.available_at <= v_now
+           AND NOT v_row.cancel_requested THEN
             PERFORM pgwf._notify_need(v_row.next_need, v_row.job_id);
         END IF;
 
@@ -240,6 +301,23 @@ BEGIN
         became_unblocked := v_row.now_unblocked;
         RETURN NEXT;
     END LOOP;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION pgwf._update_waiters_for_completion(
+    p_completed_job_id TEXT
+)
+RETURNS TABLE(job_id TEXT, next_need TEXT, became_unblocked BOOLEAN)
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    IF p_completed_job_id IS NULL THEN
+        RETURN;
+    END IF;
+
+    RETURN QUERY
+    SELECT *
+    FROM pgwf._update_waiters_for_completion_bulk(ARRAY[p_completed_job_id]);
 END;
 $$;
 
@@ -305,7 +383,9 @@ BEGIN
               j.available_at
     INTO job_id, next_need, wait_for, available_at;
 
-    PERFORM pgwf._notify_need(next_need, job_id);
+    IF NOT p_locked_job.cancel_requested THEN
+        PERFORM pgwf._notify_need(next_need, job_id);
+    END IF;
 
     PERFORM pgwf._emit_trace_event(
         job_id,
@@ -385,6 +465,7 @@ AS $$
 DECLARE
     v_wait_for TEXT[];
     v_effective_available TIMESTAMPTZ := COALESCE(p_available_at, clock_timestamp());
+    v_cancel_requested BOOLEAN;
 BEGIN
     IF EXISTS (SELECT 1 FROM pgwf.jobs_archive ja WHERE ja.job_id = p_job_id) THEN
         RAISE EXCEPTION 'job_id % has already completed and cannot be resubmitted', p_job_id;
@@ -394,10 +475,12 @@ BEGIN
 
     INSERT INTO pgwf.jobs (job_id, next_need, wait_for, singleton_key, available_at)
     VALUES (p_job_id, p_next_need, v_wait_for, p_singleton_key, v_effective_available)
-    RETURNING pgwf.jobs.job_id, pgwf.jobs.next_need, pgwf.jobs.wait_for, pgwf.jobs.available_at
-    INTO job_id, next_need, wait_for, available_at;
+    RETURNING pgwf.jobs.job_id, pgwf.jobs.next_need, pgwf.jobs.wait_for, pgwf.jobs.available_at, pgwf.jobs.cancel_requested
+    INTO job_id, next_need, wait_for, available_at, v_cancel_requested;
 
-    PERFORM pgwf._notify_need(next_need, job_id);
+    IF NOT v_cancel_requested THEN
+        PERFORM pgwf._notify_need(next_need, job_id);
+    END IF;
 
     PERFORM pgwf._emit_trace_event(
         p_job_id,
@@ -420,6 +503,77 @@ BEGIN
     );
 
     RETURN NEXT;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION pgwf.cancel_job(
+    p_job_id TEXT,
+    p_worker_id TEXT,
+    p_reason TEXT DEFAULT NULL
+)
+RETURNS pgwf.jobs
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_job pgwf.jobs%ROWTYPE;
+    v_now TIMESTAMPTZ := clock_timestamp();
+BEGIN
+    IF p_job_id IS NULL THEN
+        RAISE EXCEPTION 'job_id cannot be NULL';
+    END IF;
+    IF p_worker_id IS NULL THEN
+        RAISE EXCEPTION 'worker_id cannot be NULL';
+    END IF;
+
+    SELECT *
+    INTO v_job
+    FROM pgwf.jobs
+    WHERE job_id = p_job_id
+    FOR UPDATE;
+
+    IF NOT FOUND THEN
+        IF EXISTS (SELECT 1 FROM pgwf.jobs_archive WHERE job_id = p_job_id) THEN
+            RAISE EXCEPTION 'job_id % has already completed and cannot be cancelled', p_job_id;
+        END IF;
+        RAISE EXCEPTION 'job_id % does not exist', p_job_id;
+    END IF;
+
+    IF v_job.cancel_requested THEN
+        PERFORM pgwf._emit_trace_event(
+            p_job_id,
+            'job_cancel_requested',
+            p_worker_id,
+            jsonb_build_object(
+                'job_id', p_job_id,
+                'worker_id', p_worker_id,
+                'reason', p_reason,
+                'already_cancelled', TRUE,
+                'was_active', v_job.lease_expires_at > v_now
+            )
+        );
+        RETURN v_job;
+    END IF;
+
+    UPDATE pgwf.jobs
+    SET cancel_requested = TRUE,
+        cancel_requested_by = p_worker_id,
+        cancel_requested_at = v_now
+    WHERE job_id = p_job_id
+    RETURNING * INTO v_job;
+
+    PERFORM pgwf._emit_trace_event(
+        p_job_id,
+        'job_cancel_requested',
+        p_worker_id,
+        jsonb_build_object(
+            'job_id', p_job_id,
+            'worker_id', p_worker_id,
+            'reason', p_reason,
+            'was_active', v_job.lease_expires_at > v_now
+        )
+    );
+
+    RETURN v_job;
 END;
 $$;
 
@@ -543,6 +697,10 @@ BEGIN
         format('active lease not found for job %s', p_job_id)
     );
 
+    IF v_job.cancel_requested THEN
+        RAISE EXCEPTION 'job %s is cancelled and cannot extend the lease', p_job_id;
+    END IF;
+
     v_new := clock_timestamp() + make_interval(secs => p_additional_seconds);
 
     UPDATE pgwf.jobs
@@ -590,6 +748,10 @@ BEGIN
         p_lease_id,
         format('job %s is not currently leased with lease %s', p_job_id, p_lease_id)
     );
+
+    IF v_job.cancel_requested THEN
+        RAISE EXCEPTION 'job %s is cancelled and cannot be rescheduled', p_job_id;
+    END IF;
 
     RETURN QUERY
     SELECT *
@@ -658,6 +820,119 @@ BEGIN
 END;
 $$;
 
+CREATE OR REPLACE FUNCTION pgwf.archive_cancelled_jobs(
+    p_worker_id TEXT,
+    p_limit INTEGER DEFAULT 100
+)
+RETURNS INTEGER
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_job_ids TEXT[];
+    v_archived_count INTEGER := 0;
+    v_trace_enabled BOOLEAN := pgwf.is_trace_enabled();
+    v_effective_limit INTEGER := COALESCE(p_limit, 0);
+BEGIN
+    IF p_worker_id IS NULL THEN
+        RAISE EXCEPTION 'worker_id cannot be NULL';
+    END IF;
+    IF v_effective_limit <= 0 THEN
+        RAISE EXCEPTION 'limit must be positive';
+    END IF;
+
+    WITH candidates AS (
+        SELECT job_id
+        FROM pgwf.jobs
+        WHERE cancel_requested
+          AND lease_expires_at <= clock_timestamp()
+        ORDER BY created_at
+        LIMIT v_effective_limit
+        FOR UPDATE SKIP LOCKED
+    )
+    SELECT array_agg(job_id ORDER BY job_id)
+    INTO v_job_ids
+    FROM candidates;
+
+    IF v_job_ids IS NULL OR array_length(v_job_ids, 1) = 0 THEN
+        RETURN 0;
+    END IF;
+
+    WITH archived AS (
+        INSERT INTO pgwf.jobs_archive (
+            job_id,
+            next_need,
+            wait_for,
+            singleton_key,
+            created_at,
+            lease_id,
+            cancel_requested,
+            cancel_requested_by,
+            cancel_requested_at
+        )
+        SELECT
+            j.job_id,
+            j.next_need,
+            j.wait_for,
+            j.singleton_key,
+            j.created_at,
+            j.lease_id,
+            j.cancel_requested,
+            j.cancel_requested_by,
+            j.cancel_requested_at
+        FROM pgwf.jobs j
+        WHERE j.job_id = ANY(v_job_ids)
+        RETURNING *
+    ),
+    deleted AS (
+        DELETE FROM pgwf.jobs j
+        USING archived a
+        WHERE j.job_id = a.job_id
+        RETURNING j.job_id
+    ),
+    per_job_trace AS (
+        INSERT INTO pgwf.jobs_trace (job_id, event_type, worker_id, input_data, output_data)
+        SELECT
+            a.job_id,
+            'job_cancel_archived',
+            p_worker_id,
+            jsonb_build_object(
+                'job_id', a.job_id,
+                'worker_id', p_worker_id,
+                'cancel_requested_at', a.cancel_requested_at
+            ),
+            jsonb_build_object('archived_row', to_jsonb(a))
+        FROM archived a
+        WHERE v_trace_enabled
+    )
+    SELECT
+        COALESCE(COUNT(*), 0),
+        COALESCE(array_agg(job_id), ARRAY[]::TEXT[])
+    INTO v_archived_count, v_job_ids
+    FROM deleted;
+
+    IF v_archived_count = 0 THEN
+        RETURN 0;
+    END IF;
+
+    PERFORM pgwf._update_waiters_for_completion_bulk(v_job_ids);
+
+    IF v_trace_enabled THEN
+        PERFORM pgwf._emit_trace_event(
+            'pgwf.archive_cancelled_jobs',
+            'job_cancel_archived_run',
+            p_worker_id,
+            jsonb_build_object(
+                'worker_id', p_worker_id,
+                'limit', v_effective_limit,
+                'archived_jobs', v_archived_count
+            )
+        );
+    END IF;
+
+    RETURN v_archived_count;
+END;
+$$;
+
 CREATE OR REPLACE FUNCTION pgwf.reschedule_unheld_job(
     p_job_id TEXT,
     p_worker_id TEXT,
@@ -681,6 +956,10 @@ BEGIN
         format('job %s is not available to reschedule', p_job_id)
     );
 
+    IF v_job.cancel_requested THEN
+        RAISE EXCEPTION 'job %s is cancelled and cannot be rescheduled', p_job_id;
+    END IF;
+
     RETURN QUERY
     SELECT *
     FROM pgwf._reschedule_locked_job(
@@ -694,5 +973,32 @@ BEGIN
     );
 END;
 $$;
+
+DO $pgwf$
+DECLARE
+    v_job_id INTEGER;
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'pg_cron') THEN
+        BEGIN
+            FOR v_job_id IN
+                SELECT jobid FROM cron.job WHERE jobname = 'pgwf_archive_cancelled'
+            LOOP
+                PERFORM cron.unschedule(v_job_id);
+            END LOOP;
+
+            PERFORM cron.schedule(
+                'pgwf_archive_cancelled',
+                '* * * * *',
+                $$SELECT pgwf.archive_cancelled_jobs('pgwf-cron', 500);$$
+            );
+        EXCEPTION
+            WHEN undefined_table THEN
+                RAISE NOTICE 'pg_cron catalog not ready; skipping schedule';
+            WHEN undefined_function THEN
+                RAISE NOTICE 'pg_cron scheduling functions unavailable; skipping schedule';
+        END;
+    END IF;
+END;
+$pgwf$;
 
 COMMIT;

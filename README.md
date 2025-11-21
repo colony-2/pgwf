@@ -19,21 +19,23 @@ pgwf (Postgres Workflow) is a pure-SQL workflow engine. It's built specifically 
 | `reschedule_unheld_job` | Mutates any `READY` job’s metadata/availability without first needing a lease.                                         | `reschedule_unheld_job(job_id TEXT, worker_id TEXT, next_need TEXT, wait_for TEXT[], singleton_key TEXT, available_at TIMESTAMPTZ)`         |
 | `complete_job`    | Archives the job, deletes it from `pgwf.jobs`, removes the job_id from dependents, and wakes listeners.                | `complete_job(job_id TEXT, lease_id TEXT, worker_id TEXT)`                                                                                  |
 | `complete_unheld_job` | Archives a `READY` job that locking and completing in a single op (and unblocking dependent work/notifying as needed). | `complete_unheld_job(job_id TEXT, worker_id TEXT)`                                                                                          |
+| `cancel_job` | Marks a job for cancellation, preventing additional leases, extensions, or reschedules while capturing who requested it. | `cancel_job(job_id TEXT, worker_id TEXT, reason TEXT)` |
+| `archive_cancelled_jobs` | Bulk-archives cancelled jobs whose leases have expired, removes dependencies, and emits aggregate traces. | `archive_cancelled_jobs(worker_id TEXT, limit INTEGER)` |
 
 ### Backing Tables
 
 | Table | Columns (summary) | Purpose |
 |-------|-------------------|---------|
-| `jobs` | `job_id`, `next_need`, `wait_for[]`, `singleton_key`, `available_at`, `lease_id`, `lease_expires_at`, timestamps | Live job metadata for runnable/leased/delayed jobs. |
-| `jobs_archive` | `job_id`, `next_need`, `wait_for[]`, `singleton_key`, `created_at`, `lease_id`, `archived_at` | Immutable snapshot for completed jobs; prevents `job_id` reuse. |
+| `jobs` | `job_id`, `next_need`, `wait_for[]`, `singleton_key`, `available_at`, `lease_id`, `lease_expires_at`, timestamps, cancellation metadata | Live job metadata for runnable/leased/delayed jobs. |
+| `jobs_archive` | `job_id`, `next_need`, `wait_for[]`, `singleton_key`, `created_at`, `lease_id`, `archived_at`, cancellation metadata | Immutable snapshot for completed or cancelled jobs; prevents `job_id` reuse. |
 | `jobs_trace` | `trace_id`, `job_id`, `event_type`, `worker_id`, `event_at`, `input_data`, `output_data` | Append-only audit log of every workflow call. |
 
 ### Views
 
 | View | Columns (summary) | Purpose |
 |------|-------------------|---------|
-| `jobs_with_status` | `jobs.*` plus computed `status` (`READY`, `PENDING_JOBS`, `AWAITING_FUTURE`, `ACTIVE`) | Primary locking surface for functions that care about availability + lease state. |
-| `jobs_friendly_status` | `job_id`, `status`, human-oriented columns (`creation_dt`, `pending_jobs`, `sleep_until`, `worker_id`) | Convenience view for monitoring dashboards or ad-hoc inspection. |
+| `jobs_with_status` | `jobs.*` plus computed `status` (`READY`, `PENDING_JOBS`, `AWAITING_FUTURE`, `ACTIVE`, `CANCELLED`) | Primary locking surface for functions that care about availability + lease state. |
+| `jobs_friendly_status` | `job_id`, `status`, human-oriented columns (`creation_dt`, `pending_jobs`, `sleep_until`, `worker_id`, `cancelled_at`, `cancelled_by`) | Convenience view for monitoring dashboards or ad-hoc inspection. |
 
 #### Job Status Definitions
 
@@ -43,6 +45,7 @@ pgwf (Postgres Workflow) is a pure-SQL workflow engine. It's built specifically 
 | `PENDING_JOBS` | Job is waiting for dependent jobs to complete.     |
 | `AWAITING_FUTURE` | Job is waiting for a future time to run.           |
 | `ACTIVE` | Job is currently being processed.                  |
+| `CANCELLED` | Job was marked for cancellation and is pending archival once any active lease expires. |
 
 
 ## Inspiration
@@ -72,6 +75,10 @@ The workflow engine patterns here are inspired in part by durable execution syst
 - **Composable** – Functions can be called from stored procedures, application code, or CLI sessions.
 
 ## Key Capabilities
+
+### Cancellation Lifecycle
+
+Operators can call `pgwf.cancel_job` to mark in-flight or queued work for cancellation. Once a cancelled job’s lease expires (or if it was `READY`/`PENDING_JOBS`), it transitions to the `CANCELLED` status so it no longer leases, emits notifications, or blocks dependent work from progressing. The `pgwf.archive_cancelled_jobs` function performs bulk archival of these rows, drops the cancelled job_ids from any `wait_for` arrays, and appends both per-job (`job_cancel_archived`) and aggregate (`job_cancel_archived_run`) trace events. When the `pg_cron` extension is available, the schema automatically schedules `SELECT pgwf.archive_cancelled_jobs('pgwf-cron', 500);` to run every minute so cancelled rows are reclaimed without external automation. Environments without `pg_cron` can invoke the same function manually or via their own scheduler.
 
 ### Lease IDs
 
