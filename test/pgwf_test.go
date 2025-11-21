@@ -109,6 +109,9 @@ func resetTables(t *testing.T) {
 	if _, err := testDB.Exec(`TRUNCATE pgwf.jobs, pgwf.jobs_archive, pgwf.jobs_trace RESTART IDENTITY`); err != nil {
 		t.Fatalf("failed to reset tables: %v", err)
 	}
+	if _, err := testDB.Exec(`SELECT pgwf.set_crash_concern_threshold($1)`, 5); err != nil {
+		t.Fatalf("failed to reset crash concern threshold: %v", err)
+	}
 }
 
 func TestSubmitAndLeaseFlow(t *testing.T) {
@@ -762,10 +765,10 @@ func TestJobsStatusViews(t *testing.T) {
 	}
 
 	wantStatus := map[string]string{
-		"job-active":  "ACTIVE",
-		"job-future":  "AWAITING_FUTURE",
-		"job-pending": "PENDING_JOBS",
-		"job-ready":   "READY",
+		"job-active":    "ACTIVE",
+		"job-future":    "AWAITING_FUTURE",
+		"job-pending":   "PENDING_JOBS",
+		"job-ready":     "READY",
 		"job-cancelled": "CANCELLED",
 	}
 	for jobID, want := range wantStatus {
@@ -1172,6 +1175,200 @@ func TestRescheduleUnheldJob(t *testing.T) {
 	leasedJob, _ := leaseSingleJob(t, []string{"cap.leased"})
 	if _, err := testDB.Exec(`SELECT pgwf.reschedule_unheld_job($1, $2, $3)`, leasedJob, "worker", "cap.other"); err == nil || !strings.Contains(err.Error(), "is not available") {
 		t.Fatalf("expected leased job error, got %v", err)
+	}
+}
+
+func TestCrashConcernCountingAndClearing(t *testing.T) {
+	resetTables(t)
+
+	if _, err := testDB.Exec(`SELECT pgwf.set_crash_concern_threshold($1)`, 1); err != nil {
+		t.Fatalf("set crash threshold: %v", err)
+	}
+
+	if _, err := testDB.Exec(`SELECT pgwf.submit_job($1, $2, $3)`, "job-crash", "submitter", "cap.crash"); err != nil {
+		t.Fatalf("submit job-crash: %v", err)
+	}
+
+	jobID, _ := leaseSingleJob(t, []string{"cap.crash"})
+
+	if _, err := testDB.Exec(`UPDATE pgwf.jobs SET lease_expires_at = clock_timestamp() - interval '1 minute' WHERE job_id = $1`, jobID); err != nil {
+		t.Fatalf("force lease expiry: %v", err)
+	}
+
+	reacquiredJob, _ := leaseSingleJob(t, []string{"cap.crash"})
+	if reacquiredJob != jobID {
+		t.Fatalf("expected to reacquire %s got %s", jobID, reacquiredJob)
+	}
+
+	var total, consecutive int64
+	if err := testDB.QueryRow(`SELECT lease_expiration_count, consecutive_expirations FROM pgwf.jobs WHERE job_id = $1`, jobID).Scan(&total, &consecutive); err != nil {
+		t.Fatalf("read counters: %v", err)
+	}
+	if total != 1 || consecutive != 1 {
+		t.Fatalf("expected counters 1/1, got %d/%d", total, consecutive)
+	}
+
+	if _, err := testDB.Exec(`UPDATE pgwf.jobs SET lease_expires_at = clock_timestamp() - interval '1 second' WHERE job_id = $1`, jobID); err != nil {
+		t.Fatalf("expire active lease: %v", err)
+	}
+
+	expectNoWork(t, []string{"cap.crash"})
+
+	var status string
+	if err := testDB.QueryRow(`SELECT status FROM pgwf.jobs_with_status WHERE job_id = $1`, jobID).Scan(&status); err != nil {
+		t.Fatalf("read status: %v", err)
+	}
+	if status != "CRASH_CONCERN" {
+		t.Fatalf("expected CRASH_CONCERN status, got %s", status)
+	}
+
+	var viewConsecutive int64
+	if err := testDB.QueryRow(`SELECT consecutive_expirations FROM pgwf.jobs_with_status WHERE job_id = $1`, jobID).Scan(&viewConsecutive); err != nil {
+		t.Fatalf("read view counters: %v", err)
+	}
+	if viewConsecutive != 1 {
+		t.Fatalf("expected view consecutive 1, got %d", viewConsecutive)
+	}
+
+	var traceCount int
+	if err := testDB.QueryRow(`SELECT count(*) FROM pgwf.jobs_trace WHERE job_id = $1 AND event_type = 'lease_expiration_counter_incremented'`, jobID).Scan(&traceCount); err != nil {
+		t.Fatalf("count increment traces: %v", err)
+	}
+	if traceCount != 1 {
+		t.Fatalf("expected 1 increment trace, got %d", traceCount)
+	}
+
+	if _, err := testDB.Exec(`SELECT pgwf.clear_crash_concern($1, $2, $3)`, jobID, "operator", "ack"); err != nil {
+		t.Fatalf("clear crash concern failed: %v", err)
+	}
+
+	if err := testDB.QueryRow(`SELECT consecutive_expirations, lease_expiration_count FROM pgwf.jobs WHERE job_id = $1`, jobID).Scan(&consecutive, &total); err != nil {
+		t.Fatalf("read counters after clear: %v", err)
+	}
+	if consecutive != 0 || total != 1 {
+		t.Fatalf("expected counters 0/1 after clear, got %d/%d", consecutive, total)
+	}
+
+	if err := testDB.QueryRow(`SELECT status FROM pgwf.jobs_with_status WHERE job_id = $1`, jobID).Scan(&status); err != nil {
+		t.Fatalf("read status after clear: %v", err)
+	}
+	if status != "READY" {
+		t.Fatalf("expected READY after clear, got %s", status)
+	}
+
+	leasedAfterClear, _ := leaseSingleJob(t, []string{"cap.crash"})
+	if leasedAfterClear != jobID {
+		t.Fatalf("expected to lease %s after clearing, got %s", jobID, leasedAfterClear)
+	}
+
+	var clearTraceCount int
+	if err := testDB.QueryRow(`SELECT count(*) FROM pgwf.jobs_trace WHERE job_id = $1 AND event_type = 'crash_concern_cleared'`, jobID).Scan(&clearTraceCount); err != nil {
+		t.Fatalf("count clear traces: %v", err)
+	}
+	if clearTraceCount != 1 {
+		t.Fatalf("expected 1 clear trace, got %d", clearTraceCount)
+	}
+}
+
+func TestRescheduleClearsCrashConcern(t *testing.T) {
+	resetTables(t)
+
+	if _, err := testDB.Exec(`SELECT pgwf.submit_job($1, $2, $3)`, "job-resched", "submitter", "cap.resched"); err != nil {
+		t.Fatalf("submit job-resched: %v", err)
+	}
+
+	jobID, _ := leaseSingleJob(t, []string{"cap.resched"})
+
+	if _, err := testDB.Exec(`UPDATE pgwf.jobs SET lease_expires_at = clock_timestamp() - interval '1 minute' WHERE job_id = $1`, jobID); err != nil {
+		t.Fatalf("force lease expiry: %v", err)
+	}
+
+	reacquiredJob, newLease := leaseSingleJob(t, []string{"cap.resched"})
+	if reacquiredJob != jobID {
+		t.Fatalf("expected to reacquire %s got %s", jobID, reacquiredJob)
+	}
+
+	var total, consecutive int64
+	if err := testDB.QueryRow(`SELECT lease_expiration_count, consecutive_expirations FROM pgwf.jobs WHERE job_id = $1`, jobID).Scan(&total, &consecutive); err != nil {
+		t.Fatalf("read counters: %v", err)
+	}
+	if total != 1 || consecutive != 1 {
+		t.Fatalf("expected counters 1/1 before reschedule, got %d/%d", total, consecutive)
+	}
+
+	var rescheduled string
+	err := testDB.QueryRow(
+		`SELECT job_id FROM pgwf.reschedule_job($1, $2, $3, $4)`,
+		jobID,
+		newLease,
+		"worker",
+		"cap.resched",
+	).Scan(&rescheduled)
+	if err != nil {
+		t.Fatalf("reschedule_job failed: %v", err)
+	}
+	if rescheduled != jobID {
+		t.Fatalf("unexpected rescheduled job id %s", rescheduled)
+	}
+
+	if err := testDB.QueryRow(`SELECT lease_expiration_count, consecutive_expirations FROM pgwf.jobs WHERE job_id = $1`, jobID).Scan(&total, &consecutive); err != nil {
+		t.Fatalf("read counters after reschedule: %v", err)
+	}
+	if total != 1 || consecutive != 0 {
+		t.Fatalf("expected counters 1/0 after reschedule, got %d/%d", total, consecutive)
+	}
+}
+
+func TestCompleteUnheldCrashConcern(t *testing.T) {
+	resetTables(t)
+
+	if _, err := testDB.Exec(`SELECT pgwf.set_crash_concern_threshold($1)`, 1); err != nil {
+		t.Fatalf("set crash threshold: %v", err)
+	}
+
+	if _, err := testDB.Exec(`SELECT pgwf.submit_job($1, $2, $3)`, "job-crash-complete", "submitter", "cap.crash.complete"); err != nil {
+		t.Fatalf("submit job-crash-complete: %v", err)
+	}
+
+	jobID, _ := leaseSingleJob(t, []string{"cap.crash.complete"})
+
+	if _, err := testDB.Exec(`UPDATE pgwf.jobs SET lease_expires_at = clock_timestamp() - interval '1 minute' WHERE job_id = $1`, jobID); err != nil {
+		t.Fatalf("force lease expiry: %v", err)
+	}
+
+	// reacquire once to trigger the crash concern threshold
+	reacquiredJob, _ := leaseSingleJob(t, []string{"cap.crash.complete"})
+	if reacquiredJob != jobID {
+		t.Fatalf("expected to reacquire %s got %s", jobID, reacquiredJob)
+	}
+
+	// expire immediately so status flips to CRASH_CONCERN
+	if _, err := testDB.Exec(`UPDATE pgwf.jobs SET lease_expires_at = clock_timestamp() - interval '1 second' WHERE job_id = $1`, jobID); err != nil {
+		t.Fatalf("expire active lease: %v", err)
+	}
+
+	var status string
+	if err := testDB.QueryRow(`SELECT status FROM pgwf.jobs_with_status WHERE job_id = $1`, jobID).Scan(&status); err != nil {
+		t.Fatalf("read status: %v", err)
+	}
+	if status != "CRASH_CONCERN" {
+		t.Fatalf("expected CRASH_CONCERN status, got %s", status)
+	}
+
+	if _, err := testDB.Exec(`SELECT pgwf.complete_unheld_job($1, $2)`, jobID, "operator"); err != nil {
+		t.Fatalf("complete_unheld_job failed: %v", err)
+	}
+
+	if hasRow(t, `SELECT 1 FROM pgwf.jobs WHERE job_id = $1`, jobID) {
+		t.Fatalf("expected job to be archived")
+	}
+
+	var archivedCount int
+	if err := testDB.QueryRow(`SELECT count(*) FROM pgwf.jobs_archive WHERE job_id = $1`, jobID).Scan(&archivedCount); err != nil {
+		t.Fatalf("count archived rows: %v", err)
+	}
+	if archivedCount != 1 {
+		t.Fatalf("expected job archived exactly once, got %d", archivedCount)
 	}
 }
 

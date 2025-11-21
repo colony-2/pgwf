@@ -26,6 +26,8 @@ CREATE TABLE IF NOT EXISTS pgwf.jobs (
     available_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
     lease_id TEXT,
     lease_expires_at TIMESTAMPTZ NOT NULL DEFAULT '-infinity',
+    lease_expiration_count BIGINT NOT NULL DEFAULT 0,
+    consecutive_expirations BIGINT NOT NULL DEFAULT 0,
     created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
     cancel_requested BOOLEAN NOT NULL DEFAULT FALSE,
     cancel_requested_by TEXT,
@@ -40,6 +42,8 @@ CREATE TABLE IF NOT EXISTS pgwf.jobs_archive (
     singleton_key TEXT,
     created_at TIMESTAMPTZ NOT NULL,
     lease_id TEXT,
+    lease_expiration_count BIGINT NOT NULL DEFAULT 0,
+    consecutive_expirations BIGINT NOT NULL DEFAULT 0,
     cancel_requested BOOLEAN NOT NULL DEFAULT FALSE,
     cancel_requested_by TEXT,
     cancel_requested_at TIMESTAMPTZ
@@ -55,6 +59,31 @@ CREATE TABLE IF NOT EXISTS pgwf.jobs_trace (
     output_data JSONB
 );
 
+CREATE OR REPLACE FUNCTION pgwf.crash_concern_threshold()
+RETURNS INTEGER
+LANGUAGE sql
+AS $$
+    SELECT 5;
+$$;
+
+CREATE OR REPLACE FUNCTION pgwf.set_crash_concern_threshold(p_threshold INTEGER)
+RETURNS INTEGER
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    IF p_threshold IS NULL OR p_threshold <= 0 THEN
+        RAISE EXCEPTION 'threshold must be positive';
+    END IF;
+
+    EXECUTE format(
+        'CREATE OR REPLACE FUNCTION pgwf.crash_concern_threshold() RETURNS INTEGER LANGUAGE plpgsql AS %L',
+        format('BEGIN RETURN %s; END;', p_threshold)
+    );
+
+    RETURN p_threshold;
+END;
+$$;
+
 CREATE OR REPLACE VIEW pgwf.jobs_with_status AS
 SELECT
     j.*,
@@ -63,6 +92,7 @@ SELECT
         WHEN j.cancel_requested THEN 'CANCELLED'
         WHEN j.available_at > clock_timestamp() THEN 'AWAITING_FUTURE'
         WHEN COALESCE(array_length(j.wait_for, 1), 0) > 0 THEN 'PENDING_JOBS'
+        WHEN j.consecutive_expirations >= pgwf.crash_concern_threshold() THEN 'CRASH_CONCERN'
         ELSE 'READY'
     END AS status
 FROM pgwf.jobs j;
@@ -149,7 +179,10 @@ BEGIN
     INTO v_row
     FROM pgwf.jobs_with_status
     WHERE job_id = p_job_id
-      AND status = p_status
+      AND (
+          status = p_status
+          OR (p_status = 'READY' AND status = 'CRASH_CONCERN')
+      )
       AND (p_expected_lease_id IS NULL OR lease_id = p_expected_lease_id)
     FOR UPDATE;
 
@@ -221,6 +254,8 @@ BEGIN
         singleton_key,
         created_at,
         lease_id,
+        lease_expiration_count,
+        consecutive_expirations,
         cancel_requested,
         cancel_requested_by,
         cancel_requested_at
@@ -232,6 +267,8 @@ BEGIN
         p_locked_job.singleton_key,
         p_locked_job.created_at,
         p_locked_job.lease_id,
+        p_locked_job.lease_expiration_count,
+        p_locked_job.consecutive_expirations,
         p_locked_job.cancel_requested,
         p_locked_job.cancel_requested_by,
         p_locked_job.cancel_requested_at
@@ -332,6 +369,7 @@ AS $$
 DECLARE
     v_archive pgwf.jobs_archive%ROWTYPE;
 BEGIN
+    p_locked_job.consecutive_expirations := 0;
     v_archive := pgwf._archive_and_delete_job(p_locked_job);
 
     PERFORM pgwf._update_waiters_for_completion(p_locked_job.job_id);
@@ -374,6 +412,7 @@ BEGIN
         wait_for = v_wait_for,
         singleton_key = p_singleton_key,
         available_at = v_available_at,
+        consecutive_expirations = 0,
         lease_id = NULL,
         lease_expires_at = '-infinity'
     WHERE j.job_id = p_locked_job.job_id
@@ -600,6 +639,11 @@ DECLARE
     v_expires TIMESTAMPTZ;
     v_count INTEGER := 0;
     v_cap TEXT;
+    v_previous_lease_id TEXT;
+    v_previous_lease_expires_at TIMESTAMPTZ;
+    v_previous_lease_expired BOOLEAN;
+    v_total_expirations BIGINT;
+    v_consecutive_expirations BIGINT;
 BEGIN
     IF v_caps IS NULL OR array_length(v_caps, 1) = 0 THEN
         RAISE EXCEPTION 'worker_caps cannot be empty';
@@ -615,9 +659,12 @@ BEGIN
 
     v_expires := v_now + make_interval(secs => p_lease_seconds);
 
-    FOR job_id, lease_id, next_need, singleton_key, wait_for, available_at, lease_expires_at IN
+    FOR job_id, lease_id, next_need, singleton_key, wait_for, available_at, lease_expires_at,
+        v_previous_lease_id, v_previous_lease_expires_at, v_previous_lease_expired,
+        v_total_expirations, v_consecutive_expirations IN
         WITH candidates AS (
-            SELECT jws.*
+            SELECT jws.*,
+                   (jws.lease_id IS NOT NULL AND jws.lease_expires_at <= v_now) AS lease_was_expired
             FROM pgwf.jobs_with_status jws
             WHERE jws.status = 'READY'
               AND jws.next_need = ANY(v_caps)
@@ -635,12 +682,48 @@ BEGIN
         )
         UPDATE pgwf.jobs j
         SET
+            lease_expiration_count = CASE
+                WHEN c.lease_was_expired THEN j.lease_expiration_count + 1
+                ELSE j.lease_expiration_count
+            END,
+            consecutive_expirations = CASE
+                WHEN c.lease_was_expired THEN j.consecutive_expirations + 1
+                ELSE j.consecutive_expirations
+            END,
             lease_id = gen_random_uuid()::TEXT,
             lease_expires_at = v_expires
         FROM candidates c
         WHERE j.job_id = c.job_id
-        RETURNING j.job_id, j.lease_id, j.next_need, j.singleton_key, j.wait_for, j.available_at, j.lease_expires_at
+        RETURNING j.job_id,
+                  j.lease_id,
+                  j.next_need,
+                  j.singleton_key,
+                  j.wait_for,
+                  j.available_at,
+                  j.lease_expires_at,
+                  c.lease_id AS previous_lease_id,
+                  c.lease_expires_at AS previous_lease_expires_at,
+                  c.lease_was_expired AS lease_previously_expired,
+                  j.lease_expiration_count,
+                  j.consecutive_expirations
     LOOP
+
+        IF v_previous_lease_expired THEN
+            PERFORM pgwf._emit_trace_event(
+                job_id,
+                'lease_expiration_counter_incremented',
+                p_worker_id,
+                jsonb_build_object(
+                    'worker_id', p_worker_id,
+                    'worker_caps', v_caps,
+                    'previous_lease_id', v_previous_lease_id,
+                    'previous_lease_expires_at', v_previous_lease_expires_at,
+                    'lease_expiration_count', v_total_expirations,
+                    'consecutive_expirations', v_consecutive_expirations
+                )
+            );
+        END IF;
+
         v_count := v_count + 1;
 
         PERFORM pgwf._emit_trace_event(
@@ -820,6 +903,65 @@ BEGIN
 END;
 $$;
 
+CREATE OR REPLACE FUNCTION pgwf.clear_crash_concern(
+    p_job_id TEXT,
+    p_worker_id TEXT,
+    p_reason TEXT DEFAULT NULL
+)
+RETURNS BOOLEAN
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_job pgwf.jobs%ROWTYPE;
+    v_previous_consecutive BIGINT;
+BEGIN
+    IF p_job_id IS NULL THEN
+        RAISE EXCEPTION 'job_id cannot be NULL';
+    END IF;
+    IF p_worker_id IS NULL THEN
+        RAISE EXCEPTION 'worker_id cannot be NULL';
+    END IF;
+
+    SELECT *
+    INTO v_job
+    FROM pgwf.jobs
+    WHERE job_id = p_job_id
+    FOR UPDATE;
+
+    IF NOT FOUND THEN
+        IF EXISTS (SELECT 1 FROM pgwf.jobs_archive WHERE job_id = p_job_id) THEN
+            RAISE EXCEPTION 'job_id % has already been archived and cannot clear crash concern', p_job_id;
+        END IF;
+        RAISE EXCEPTION 'job_id % does not exist', p_job_id;
+    END IF;
+
+    IF v_job.cancel_requested THEN
+        RAISE EXCEPTION 'job % is cancelled and cannot clear crash concern', p_job_id;
+    END IF;
+
+    v_previous_consecutive := v_job.consecutive_expirations;
+
+    UPDATE pgwf.jobs
+    SET consecutive_expirations = 0
+    WHERE job_id = v_job.job_id;
+
+    PERFORM pgwf._emit_trace_event(
+        p_job_id,
+        'crash_concern_cleared',
+        p_worker_id,
+        jsonb_build_object(
+            'job_id', p_job_id,
+            'worker_id', p_worker_id,
+            'previous_consecutive_expirations', v_previous_consecutive,
+            'reason', p_reason
+        ),
+        jsonb_build_object('consecutive_expirations', 0)
+    );
+
+    RETURN TRUE;
+END;
+$$;
+
 CREATE OR REPLACE FUNCTION pgwf.archive_cancelled_jobs(
     p_worker_id TEXT,
     p_limit INTEGER DEFAULT 100
@@ -865,6 +1007,8 @@ BEGIN
             singleton_key,
             created_at,
             lease_id,
+            lease_expiration_count,
+            consecutive_expirations,
             cancel_requested,
             cancel_requested_by,
             cancel_requested_at
@@ -876,6 +1020,8 @@ BEGIN
             j.singleton_key,
             j.created_at,
             j.lease_id,
+            j.lease_expiration_count,
+            j.consecutive_expirations,
             j.cancel_requested,
             j.cancel_requested_by,
             j.cancel_requested_at

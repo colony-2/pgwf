@@ -26,15 +26,15 @@ pgwf (Postgres Workflow) is a pure-SQL workflow engine. It's built specifically 
 
 | Table | Columns (summary) | Purpose |
 |-------|-------------------|---------|
-| `jobs` | `job_id`, `next_need`, `wait_for[]`, `singleton_key`, `available_at`, `lease_id`, `lease_expires_at`, timestamps, cancellation metadata | Live job metadata for runnable/leased/delayed jobs. |
-| `jobs_archive` | `job_id`, `next_need`, `wait_for[]`, `singleton_key`, `created_at`, `lease_id`, `archived_at`, cancellation metadata | Immutable snapshot for completed or cancelled jobs; prevents `job_id` reuse. |
+| `jobs` | `job_id`, `next_need`, `wait_for[]`, `singleton_key`, `available_at`, `lease_id`, `lease_expires_at`, `lease_expiration_count`, `consecutive_expirations`, timestamps, cancellation metadata | Live job metadata for runnable/leased/delayed jobs plus crash-concern counters. |
+| `jobs_archive` | `job_id`, `next_need`, `wait_for[]`, `singleton_key`, `created_at`, `lease_id`, `lease_expiration_count`, `consecutive_expirations`, `archived_at`, cancellation metadata | Immutable snapshot for completed or cancelled jobs; prevents `job_id` reuse while preserving historical counters. |
 | `jobs_trace` | `trace_id`, `job_id`, `event_type`, `worker_id`, `event_at`, `input_data`, `output_data` | Append-only audit log of every workflow call. |
 
 ### Views
 
 | View | Columns (summary) | Purpose |
 |------|-------------------|---------|
-| `jobs_with_status` | `jobs.*` plus computed `status` (`READY`, `PENDING_JOBS`, `AWAITING_FUTURE`, `ACTIVE`, `CANCELLED`) | Primary locking surface for functions that care about availability + lease state. |
+| `jobs_with_status` | `jobs.*` plus computed `status` (`READY`, `PENDING_JOBS`, `AWAITING_FUTURE`, `ACTIVE`, `CRASH_CONCERN`, `CANCELLED`) | Primary locking surface for functions that care about availability + lease state. |
 | `jobs_friendly_status` | `job_id`, `status`, human-oriented columns (`creation_dt`, `pending_jobs`, `sleep_until`, `worker_id`, `cancelled_at`, `cancelled_by`) | Convenience view for monitoring dashboards or ad-hoc inspection. |
 
 #### Job Status Definitions
@@ -45,6 +45,7 @@ pgwf (Postgres Workflow) is a pure-SQL workflow engine. It's built specifically 
 | `PENDING_JOBS` | Job is waiting for dependent jobs to complete.     |
 | `AWAITING_FUTURE` | Job is waiting for a future time to run.           |
 | `ACTIVE` | Job is currently being processed.                  |
+| `CRASH_CONCERN` | Job repeatedly let leases expire; pgwf sidelines it until an operator clears the concern or reschedules/completes it. |
 | `CANCELLED` | Job was marked for cancellation and is pending archival once any active lease expires. |
 
 
@@ -126,6 +127,11 @@ To make debugging and auditing easier, pgwf records every mutation in `pgwf.jobs
 
 - `pgwf.set_trace(enabled BOOLEAN)` / `pgwf.is_trace_enabled()` – Trace logging is **enabled by default** because it is invaluable when load is moderate and you need to reconstruct timelines. Each operation inserts a JSONB payload, so high-throughput systems with their own observability pipelines can disable it via `SELECT pgwf.set_trace(FALSE)` and re-enable later.
 - `pgwf.set_notify(enabled BOOLEAN)` / `pgwf.is_notify_enabled()` – LISTEN/NOTIFY fan-out is **disabled by default** so pgwf plays nicely with connection pools (LISTEN keeps a session pinned). When disabled, pgwf neither emits `NOTIFY` events nor registers `LISTEN` channels, so workers rely on polling. Enable it on dedicated, long-lived connections with `SELECT pgwf.set_notify(TRUE)` to get near-instant wake-ups.
+- `pgwf.set_crash_concern_threshold(p_threshold INTEGER)` / `pgwf.crash_concern_threshold()` – Controls how many consecutive lease expirations a job is allowed before pgwf marks it `CRASH_CONCERN` and removes it from future `get_work` results. Defaults to 5; lower it in stricter environments or raise it if flapping jobs are expected.
+
+### Crash concern handling
+
+Every time `pgwf.get_work` picks up a job whose previous lease already expired, pgwf increments two counters on the row: the lifetime `lease_expiration_count` and the `consecutive_expirations` streak. When the streak reaches the configured crash-concern threshold, the job finishes the in-flight lease but immediately transitions to the `CRASH_CONCERN` status, which causes subsequent `get_work` calls to ignore it. Operators can inspect the counters directly via `pgwf.jobs_with_status` and `pgwf.jobs_friendly_status`, then call `pgwf.clear_crash_concern(job_id, worker_id, reason TEXT DEFAULT NULL)` once they have remediated the underlying problem. Clearing the concern resets `consecutive_expirations` to zero (historical totals remain) and emits a `crash_concern_cleared` trace so the job becomes `READY` again.
 
 ## Execution Metadata vs Payload State
 
