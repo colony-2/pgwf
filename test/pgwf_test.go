@@ -745,7 +745,15 @@ func TestJobsStatusViews(t *testing.T) {
 		t.Fatalf("cancel job-cancelled: %v", err)
 	}
 
-	targetIDs := []string{"job-active", "job-future", "job-pending", "job-ready", "job-cancelled"}
+	expiredAt := time.Now().UTC().Add(-time.Hour).Truncate(time.Microsecond)
+	if _, err := testDB.Exec(
+		`SELECT pgwf.submit_job($1, $2, $3, $4, $5, $6, $7)`,
+		"job-expired", "submitter", "cap.expired", pqStringArray([]string{}), nil, nil, expiredAt,
+	); err != nil {
+		t.Fatalf("submit job-expired: %v", err)
+	}
+
+	targetIDs := []string{"job-active", "job-future", "job-pending", "job-ready", "job-cancelled", "job-expired"}
 	rows, err := testDB.Query(`SELECT job_id, status FROM pgwf.jobs_with_status WHERE job_id = ANY($1)`, pqStringArray(targetIDs))
 	if err != nil {
 		t.Fatalf("query jobs_with_status: %v", err)
@@ -770,6 +778,7 @@ func TestJobsStatusViews(t *testing.T) {
 		"job-pending":   "PENDING_JOBS",
 		"job-ready":     "READY",
 		"job-cancelled": "CANCELLED",
+		"job-expired":   "EXPIRED",
 	}
 	for jobID, want := range wantStatus {
 		got, ok := seen[jobID]
@@ -788,6 +797,7 @@ func TestJobsStatusViews(t *testing.T) {
 		pending     []string
 		cancelled   bool
 		cancelledBy string
+		expires     *time.Time
 	}
 
 	futurePtr := futureTime
@@ -797,6 +807,7 @@ func TestJobsStatusViews(t *testing.T) {
 		"job-pending":   {status: "PENDING_JOBS", pending: []string{"job-blocker"}},
 		"job-ready":     {status: "READY"},
 		"job-cancelled": {status: "CANCELLED", cancelled: true, cancelledBy: "operator"},
+		"job-expired":   {status: "EXPIRED", expires: &expiredAt},
 	}
 
 	for jobID, exp := range expectFriendly {
@@ -808,12 +819,13 @@ func TestJobsStatusViews(t *testing.T) {
 			worker   sql.NullString
 			cancelAt sql.NullTime
 			cancelBy sql.NullString
+			expires  sql.NullTime
 		)
 
 		err := testDB.QueryRow(
-			`SELECT status, creation_dt, pending_jobs, sleep_until, worker_id, cancelled_at, cancelled_by FROM pgwf.jobs_friendly_status WHERE job_id = $1`,
+			`SELECT status, creation_dt, pending_jobs, sleep_until, worker_id, cancelled_at, cancelled_by, CASE WHEN expires_at = 'infinity' THEN NULL ELSE expires_at END FROM pgwf.jobs_friendly_status WHERE job_id = $1`,
 			jobID,
-		).Scan(&status, &creation, &pending, &sleep, &worker, &cancelAt, &cancelBy)
+		).Scan(&status, &creation, &pending, &sleep, &worker, &cancelAt, &cancelBy, &expires)
 		if err != nil {
 			t.Fatalf("query friendly row for %s: %v", jobID, err)
 		}
@@ -867,6 +879,90 @@ func TestJobsStatusViews(t *testing.T) {
 				t.Fatalf("expected cancelled_by NULL for %s, got %s", jobID, cancelBy.String)
 			}
 		}
+		if exp.expires != nil {
+			if !expires.Valid || !expires.Time.Equal(exp.expires.Truncate(time.Microsecond)) {
+				t.Fatalf("expires mismatch for %s: got %v want %v", jobID, expires, exp.expires)
+			}
+		} else if expires.Valid {
+			t.Fatalf("expected expires_at NULL for %s, got %v", jobID, expires.Time)
+		}
+	}
+}
+
+func TestExpiredJobsSkipLeasing(t *testing.T) {
+	resetTables(t)
+
+	expiredAt := time.Now().UTC().Add(-time.Hour).Truncate(time.Microsecond)
+	if _, err := testDB.Exec(
+		`SELECT pgwf.submit_job($1, $2, $3, $4, $5, $6, $7)`,
+		"job-expired", "submitter", "cap.expired", pqStringArray([]string{}), nil, nil, expiredAt,
+	); err != nil {
+		t.Fatalf("submit expired job: %v", err)
+	}
+
+	expectNoWork(t, []string{"cap.expired"})
+
+	var status string
+	if err := testDB.QueryRow(`SELECT status FROM pgwf.jobs_with_status WHERE job_id = $1`, "job-expired").Scan(&status); err != nil {
+		t.Fatalf("query status: %v", err)
+	}
+	if status != "EXPIRED" {
+		t.Fatalf("expected EXPIRED status, got %s", status)
+	}
+
+	var rescheduled string
+	err := testDB.QueryRow(
+		`SELECT job_id FROM pgwf.reschedule_unheld_job($1, $2, $3, $4, $5, $6)`,
+		"job-expired", "operator", "cap.expired.new", pqStringArray([]string{}), nil, time.Now().UTC(),
+	).Scan(&rescheduled)
+	if err != nil {
+		t.Fatalf("reschedule expired job: %v", err)
+	}
+	if rescheduled != "job-expired" {
+		t.Fatalf("expected job-expired reschedule, got %s", rescheduled)
+	}
+
+	if err := testDB.QueryRow(`SELECT status FROM pgwf.jobs_with_status WHERE job_id = $1`, "job-expired").Scan(&status); err != nil {
+		t.Fatalf("query status after reschedule: %v", err)
+	}
+	if status != "EXPIRED" {
+		t.Fatalf("expected EXPIRED status after reschedule, got %s", status)
+	}
+
+	expectNoWork(t, []string{"cap.expired.new"})
+}
+
+func TestExtendLeaseOnExpiredJob(t *testing.T) {
+	resetTables(t)
+
+	expiresSoon := time.Now().UTC().Add(time.Minute).Truncate(time.Microsecond)
+	if _, err := testDB.Exec(
+		`SELECT pgwf.submit_job($1, $2, $3, $4, $5, $6, $7)`,
+		"job-extend", "submitter", "cap.extend", pqStringArray([]string{}), nil, nil, expiresSoon,
+	); err != nil {
+		t.Fatalf("submit job: %v", err)
+	}
+
+	jobID, leaseID := leaseSingleJob(t, []string{"cap.extend"})
+
+	if _, err := testDB.Exec(`UPDATE pgwf.jobs SET expires_at = clock_timestamp() - interval '1 minute' WHERE job_id = $1`, jobID); err != nil {
+		t.Fatalf("force expiry: %v", err)
+	}
+
+	var newLeaseExpiry time.Time
+	if err := testDB.QueryRow(`SELECT pgwf.extend_lease($1, $2, $3, $4)`, jobID, leaseID, "worker-extend", 120).Scan(&newLeaseExpiry); err != nil {
+		t.Fatalf("extend lease on expired job: %v", err)
+	}
+	if !newLeaseExpiry.After(time.Now().Add(time.Minute)) {
+		t.Fatalf("expected extended lease in future, got %v", newLeaseExpiry)
+	}
+
+	var status string
+	if err := testDB.QueryRow(`SELECT status FROM pgwf.jobs_with_status WHERE job_id = $1`, jobID).Scan(&status); err != nil {
+		t.Fatalf("query status after extend: %v", err)
+	}
+	if status != "ACTIVE" {
+		t.Fatalf("expected ACTIVE status after extend, got %s", status)
 	}
 }
 
