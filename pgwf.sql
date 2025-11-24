@@ -22,6 +22,7 @@ CREATE TABLE IF NOT EXISTS pgwf.jobs (
     job_id TEXT PRIMARY KEY,
     next_need TEXT NOT NULL,
     wait_for TEXT[] NOT NULL DEFAULT '{}'::TEXT[],
+    payload JSONB NOT NULL DEFAULT '{}'::JSONB,
     singleton_key TEXT,
     available_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
     expires_at TIMESTAMPTZ NOT NULL DEFAULT 'infinity',
@@ -32,7 +33,9 @@ CREATE TABLE IF NOT EXISTS pgwf.jobs (
     created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
     cancel_requested BOOLEAN NOT NULL DEFAULT FALSE,
     cancel_requested_by TEXT,
-    cancel_requested_at TIMESTAMPTZ
+    cancel_requested_at TIMESTAMPTZ,
+    CONSTRAINT jobs_payload_is_object CHECK (jsonb_typeof(payload) = 'object'),
+    CONSTRAINT jobs_payload_size_limit CHECK (pg_column_size(payload) <= 512)
 );
 
 CREATE TABLE IF NOT EXISTS pgwf.jobs_archive (
@@ -40,6 +43,7 @@ CREATE TABLE IF NOT EXISTS pgwf.jobs_archive (
     job_id TEXT PRIMARY KEY,
     next_need TEXT NOT NULL,
     wait_for TEXT[] NOT NULL DEFAULT '{}'::TEXT[],
+    payload JSONB NOT NULL DEFAULT '{}'::JSONB,
     singleton_key TEXT,
     created_at TIMESTAMPTZ NOT NULL,
     expires_at TIMESTAMPTZ NOT NULL DEFAULT 'infinity',
@@ -48,7 +52,9 @@ CREATE TABLE IF NOT EXISTS pgwf.jobs_archive (
     consecutive_expirations BIGINT NOT NULL DEFAULT 0,
     cancel_requested BOOLEAN NOT NULL DEFAULT FALSE,
     cancel_requested_by TEXT,
-    cancel_requested_at TIMESTAMPTZ
+    cancel_requested_at TIMESTAMPTZ,
+    CONSTRAINT jobs_archive_payload_is_object CHECK (jsonb_typeof(payload) = 'object'),
+    CONSTRAINT jobs_archive_payload_size_limit CHECK (pg_column_size(payload) <= 512)
 );
 
 CREATE TABLE IF NOT EXISTS pgwf.jobs_trace (
@@ -110,7 +116,8 @@ SELECT
     CASE WHEN jws.status = 'ACTIVE' THEN jws.lease_id ELSE NULL END AS worker_id,
     CASE WHEN jws.status = 'CANCELLED' THEN jws.cancel_requested_at ELSE NULL END AS cancelled_at,
     CASE WHEN jws.status = 'CANCELLED' THEN jws.cancel_requested_by ELSE NULL END AS cancelled_by,
-    jws.expires_at
+    jws.expires_at,
+    jws.payload
 FROM pgwf.jobs_with_status jws;
 
 CREATE OR REPLACE FUNCTION pgwf.is_trace_enabled()
@@ -255,6 +262,7 @@ BEGIN
         job_id,
         next_need,
         wait_for,
+        payload,
         singleton_key,
         created_at,
         expires_at,
@@ -269,6 +277,7 @@ BEGIN
         p_locked_job.job_id,
         p_locked_job.next_need,
         p_locked_job.wait_for,
+        p_locked_job.payload,
         p_locked_job.singleton_key,
         p_locked_job.created_at,
         p_locked_job.expires_at,
@@ -390,7 +399,7 @@ BEGIN
             'job_id', p_locked_job.job_id,
             'worker_id', p_worker_id
         ) || COALESCE(p_trace_context, '{}'::JSONB),
-        jsonb_build_object('archived_row', to_jsonb(v_archive))
+        jsonb_build_object('archived_row', to_jsonb(v_archive) - 'payload')
     );
 
     RETURN TRUE;
@@ -509,11 +518,12 @@ CREATE OR REPLACE FUNCTION pgwf.submit_job(
     p_worker_id TEXT,
     p_next_need TEXT,
     p_wait_for TEXT[] DEFAULT '{}'::TEXT[],
+    p_payload JSONB DEFAULT '{}'::JSONB,
     p_singleton_key TEXT DEFAULT NULL,
     p_available_at TIMESTAMPTZ DEFAULT clock_timestamp(),
     p_expires_at TIMESTAMPTZ DEFAULT NULL
 )
-RETURNS TABLE(job_id TEXT, next_need TEXT, wait_for TEXT[], available_at TIMESTAMPTZ)
+RETURNS TABLE(job_id TEXT, next_need TEXT, wait_for TEXT[], payload JSONB, available_at TIMESTAMPTZ)
 LANGUAGE plpgsql
 AS $$
 DECLARE
@@ -522,6 +532,7 @@ DECLARE
     v_expires_at TIMESTAMPTZ := COALESCE(p_expires_at, 'infinity');
     v_cancel_requested BOOLEAN;
     v_now TIMESTAMPTZ := clock_timestamp();
+    v_payload JSONB := COALESCE(p_payload, '{}'::JSONB);
 BEGIN
     IF EXISTS (SELECT 1 FROM pgwf.jobs_archive ja WHERE ja.job_id = p_job_id) THEN
         RAISE EXCEPTION 'job_id % has already completed and cannot be resubmitted', p_job_id;
@@ -529,10 +540,18 @@ BEGIN
 
     v_wait_for := pgwf.normalize_wait_for(p_wait_for);
 
-    INSERT INTO pgwf.jobs (job_id, next_need, wait_for, singleton_key, available_at, expires_at)
-    VALUES (p_job_id, p_next_need, v_wait_for, p_singleton_key, v_effective_available, v_expires_at)
-    RETURNING pgwf.jobs.job_id, pgwf.jobs.next_need, pgwf.jobs.wait_for, pgwf.jobs.available_at, pgwf.jobs.cancel_requested
-    INTO job_id, next_need, wait_for, available_at, v_cancel_requested;
+    IF jsonb_typeof(v_payload) IS DISTINCT FROM 'object' THEN
+        RAISE EXCEPTION 'payload must be a JSON object';
+    END IF;
+
+    IF pg_column_size(v_payload) > 512 THEN
+        RAISE EXCEPTION 'payload exceeds 512 bytes';
+    END IF;
+
+    INSERT INTO pgwf.jobs (job_id, next_need, wait_for, payload, singleton_key, available_at, expires_at)
+    VALUES (p_job_id, p_next_need, v_wait_for, v_payload, p_singleton_key, v_effective_available, v_expires_at)
+    RETURNING pgwf.jobs.job_id, pgwf.jobs.next_need, pgwf.jobs.wait_for, pgwf.jobs.payload, pgwf.jobs.available_at, pgwf.jobs.cancel_requested
+    INTO job_id, next_need, wait_for, payload, available_at, v_cancel_requested;
 
     IF NOT v_cancel_requested AND v_expires_at > v_now THEN
         PERFORM pgwf._notify_need(next_need, job_id);
@@ -647,6 +666,7 @@ RETURNS TABLE(
     next_need TEXT,
     singleton_key TEXT,
     wait_for TEXT[],
+    payload JSONB,
     available_at TIMESTAMPTZ,
     lease_expires_at TIMESTAMPTZ
 )
@@ -678,7 +698,7 @@ BEGIN
 
     v_expires := v_now + make_interval(secs => p_lease_seconds);
 
-    FOR job_id, lease_id, next_need, singleton_key, wait_for, available_at, lease_expires_at,
+    FOR job_id, lease_id, next_need, singleton_key, wait_for, payload, available_at, lease_expires_at,
         v_previous_lease_id, v_previous_lease_expires_at, v_previous_lease_expired,
         v_total_expirations, v_consecutive_expirations IN
         WITH candidates AS (
@@ -718,6 +738,7 @@ BEGIN
                   j.next_need,
                   j.singleton_key,
                   j.wait_for,
+                  j.payload,
                   j.available_at,
                   j.lease_expires_at,
                   c.lease_id AS previous_lease_id,
@@ -1023,6 +1044,7 @@ BEGIN
             job_id,
             next_need,
             wait_for,
+            payload,
             singleton_key,
             created_at,
             expires_at,
@@ -1037,6 +1059,7 @@ BEGIN
             j.job_id,
             j.next_need,
             j.wait_for,
+            j.payload,
             j.singleton_key,
             j.created_at,
             j.expires_at,
@@ -1064,10 +1087,10 @@ BEGIN
             p_worker_id,
             jsonb_build_object(
                 'job_id', a.job_id,
-                'worker_id', p_worker_id,
-                'cancel_requested_at', a.cancel_requested_at
+            'worker_id', p_worker_id,
+            'cancel_requested_at', a.cancel_requested_at
             ),
-            jsonb_build_object('archived_row', to_jsonb(a))
+            jsonb_build_object('archived_row', to_jsonb(a) - 'payload')
         FROM archived a
         WHERE v_trace_enabled
     )

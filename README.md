@@ -1,6 +1,6 @@
 # pgwf
 
-pgwf (Postgres Workflow) is a pure-SQL workflow engine. It's built specifically to solve for reliable coordination of complex interconnected, long running jobs without dealing with arbitrarily large or complex internal job states. The pgwf workflow engine provides for durable job metadata, leasing, and traceability entirely inside PostgreSQL. This state stays lightweight (and reasonably sized for postgres) by avoiding any integration of internal job payloads or state. When paired with journal system, we can achieve complex distributed durable patterns with minimal infrastructure complexity or need for distributed transaction coordination.
+pgwf (Postgres Workflow) is a pure-SQL workflow engine. It's built specifically to solve for reliable coordination of complex interconnected, long running jobs without dealing with arbitrarily large or complex internal job states. The pgwf workflow engine provides for durable job metadata, leasing, and traceability entirely inside PostgreSQL. Jobs may include a small immutable JSON payload (object, ≤512 bytes) captured at creation; larger state should live in external systems. When paired with journal system, we can achieve complex distributed durable patterns with minimal infrastructure complexity or need for distributed transaction coordination.
 
 ## Core Objects
 
@@ -12,7 +12,7 @@ pgwf (Postgres Workflow) is a pure-SQL workflow engine. It's built specifically 
 
 | Function          | Description                                                                                                            | Signature                                                                                                                                   |
 |-------------------|------------------------------------------------------------------------------------------------------------------------|---------------------------------------------------------------------------------------------------------------------------------------------|
-| `submit_job` | Inserts a new job, validates dependencies, and (optionally) emits notifications for `next_need`.                       | `submit_job(job_id TEXT, worker_id TEXT, next_need TEXT, wait_for TEXT[], singleton_key TEXT, available_at TIMESTAMPTZ, expires_at TIMESTAMPTZ)` |
+| `submit_job` | Inserts a new job, validates dependencies, attaches an optional payload, and (optionally) emits notifications for `next_need`. | `submit_job(job_id TEXT, worker_id TEXT, next_need TEXT, wait_for TEXT[], payload JSONB, singleton_key TEXT, available_at TIMESTAMPTZ, expires_at TIMESTAMPTZ)` |
 | `get_work`        | Leases up to `limit_jobs` that match the supplied capabilities, assigning a fresh `lease_id` and visibility timeout.   | `get_work(worker_id TEXT, worker_caps TEXT[], lease_seconds INT, limit_jobs INT)`                                                           |
 | `extend_lease`    | Heartbeats an active lease by pushing `lease_expires_at` into the future.                                              | `extend_lease(job_id TEXT, lease_id TEXT, worker_id TEXT, additional_seconds INT)`                                                          |
 | `reschedule_job`  | Returns a leased job to the queue with updated capability/dependency metadata and clears the lease.                    | `reschedule_job(job_id TEXT, lease_id TEXT, worker_id TEXT, next_need TEXT, wait_for TEXT[], singleton_key TEXT, available_at TIMESTAMPTZ)` |
@@ -26,8 +26,8 @@ pgwf (Postgres Workflow) is a pure-SQL workflow engine. It's built specifically 
 
 | Table | Columns (summary) | Purpose |
 |-------|-------------------|---------|
-| `jobs` | `job_id`, `next_need`, `wait_for[]`, `singleton_key`, `available_at`, `expires_at`, `lease_id`, `lease_expires_at`, `lease_expiration_count`, `consecutive_expirations`, timestamps, cancellation metadata | Live job metadata for runnable/leased/delayed jobs plus crash-concern counters. |
-| `jobs_archive` | `job_id`, `next_need`, `wait_for[]`, `singleton_key`, `created_at`, `expires_at`, `lease_id`, `lease_expiration_count`, `consecutive_expirations`, `archived_at`, cancellation metadata | Immutable snapshot for completed or cancelled jobs; prevents `job_id` reuse while preserving historical counters. |
+| `jobs` | `job_id`, `next_need`, `wait_for[]`, `payload`, `singleton_key`, `available_at`, `expires_at`, `lease_id`, `lease_expires_at`, `lease_expiration_count`, `consecutive_expirations`, timestamps, cancellation metadata | Live job metadata for runnable/leased/delayed jobs plus crash-concern counters. |
+| `jobs_archive` | `job_id`, `next_need`, `wait_for[]`, `payload`, `singleton_key`, `created_at`, `expires_at`, `lease_id`, `lease_expiration_count`, `consecutive_expirations`, `archived_at`, cancellation metadata | Immutable snapshot for completed or cancelled jobs; prevents `job_id` reuse while preserving historical counters. |
 | `jobs_trace` | `trace_id`, `job_id`, `event_type`, `worker_id`, `event_at`, `input_data`, `output_data` | Append-only audit log of every workflow call. |
 
 ### Views
@@ -35,7 +35,7 @@ pgwf (Postgres Workflow) is a pure-SQL workflow engine. It's built specifically 
 | View | Columns (summary) | Purpose |
 |------|-------------------|---------|
 | `jobs_with_status` | `jobs.*` plus computed `status` (`READY`, `PENDING_JOBS`, `AWAITING_FUTURE`, `ACTIVE`, `CRASH_CONCERN`, `EXPIRED`, `CANCELLED`) | Primary locking surface for functions that care about availability + lease state. |
-| `jobs_friendly_status` | `job_id`, `status`, human-oriented columns (`creation_dt`, `pending_jobs`, `sleep_until`, `worker_id`, `cancelled_at`, `cancelled_by`, `expires_at`) | Convenience view for monitoring dashboards or ad-hoc inspection. |
+| `jobs_friendly_status` | `job_id`, `status`, human-oriented columns (`creation_dt`, `pending_jobs`, `sleep_until`, `worker_id`, `cancelled_at`, `cancelled_by`, `expires_at`, `payload`) | Convenience view for monitoring dashboards or ad-hoc inspection. |
 
 #### Job Status Definitions
 
@@ -48,6 +48,12 @@ pgwf (Postgres Workflow) is a pure-SQL workflow engine. It's built specifically 
 | `ACTIVE` | Job is currently being processed.                  |
 | `CRASH_CONCERN` | Job repeatedly let leases expire; pgwf sidelines it until an operator clears the concern or reschedules/completes it. |
 | `CANCELLED` | Job was marked for cancellation and is pending archival once any active lease expires. |
+
+### Payloads
+
+- Optional JSONB object supplied at submission time; defaults to `{}`.
+- Must be an object and ≤512 bytes stored size (`pg_column_size`) in both `jobs` and `jobs_archive`.
+- Returned from `submit_job`, `get_work`, and surfaced in status views; intentionally excluded from trace rows.
 
 
 ## Inspiration
