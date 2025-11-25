@@ -412,6 +412,7 @@ CREATE OR REPLACE FUNCTION pgwf._reschedule_locked_job(
     p_next_need TEXT,
     p_wait_for TEXT[] DEFAULT '{}'::TEXT[],
     p_available_at TIMESTAMPTZ DEFAULT clock_timestamp(),
+    p_payload JSONB DEFAULT NULL,
     p_trace_context JSONB DEFAULT '{}'::JSONB
 )
 RETURNS TABLE(job_id TEXT, next_need TEXT, wait_for TEXT[], available_at TIMESTAMPTZ)
@@ -422,13 +423,25 @@ DECLARE
     v_available_at TIMESTAMPTZ := COALESCE(p_available_at, clock_timestamp());
     v_expires_at TIMESTAMPTZ;
     v_now TIMESTAMPTZ := clock_timestamp();
+    v_payload JSONB := COALESCE(p_payload, p_locked_job.payload);
 BEGIN
     v_wait_for := pgwf.normalize_wait_for(p_wait_for);
+
+    IF p_payload IS NOT NULL THEN
+        IF jsonb_typeof(p_payload) IS DISTINCT FROM 'object' THEN
+            RAISE EXCEPTION 'payload must be a JSON object';
+        END IF;
+
+        IF pg_column_size(p_payload) > 512 THEN
+            RAISE EXCEPTION 'payload exceeds 512 bytes';
+        END IF;
+    END IF;
 
     UPDATE pgwf.jobs j
     SET next_need = p_next_need,
         wait_for = v_wait_for,
         available_at = v_available_at,
+        payload = v_payload,
         consecutive_expirations = 0,
         lease_id = NULL,
         lease_expires_at = '-infinity'
@@ -851,7 +864,8 @@ CREATE OR REPLACE FUNCTION pgwf.reschedule_job(
     p_worker_id TEXT,
     p_next_need TEXT,
     p_wait_for TEXT[] DEFAULT '{}'::TEXT[],
-    p_available_at TIMESTAMPTZ DEFAULT clock_timestamp()
+    p_available_at TIMESTAMPTZ DEFAULT clock_timestamp(),
+    p_payload JSONB DEFAULT NULL
 )
 RETURNS TABLE(job_id TEXT, next_need TEXT, wait_for TEXT[], available_at TIMESTAMPTZ)
 LANGUAGE plpgsql
@@ -879,6 +893,7 @@ BEGIN
         p_next_need,
         p_wait_for,
         p_available_at,
+        p_payload,
         jsonb_build_object('lease_id', p_lease_id)
     );
 END;
@@ -1122,7 +1137,8 @@ CREATE OR REPLACE FUNCTION pgwf.reschedule_unheld_job(
     p_worker_id TEXT,
     p_next_need TEXT,
     p_wait_for TEXT[] DEFAULT '{}'::TEXT[],
-    p_available_at TIMESTAMPTZ DEFAULT clock_timestamp()
+    p_available_at TIMESTAMPTZ DEFAULT clock_timestamp(),
+    p_payload JSONB DEFAULT NULL
 )
 RETURNS TABLE(job_id TEXT, next_need TEXT, wait_for TEXT[], available_at TIMESTAMPTZ)
 LANGUAGE plpgsql
@@ -1151,6 +1167,7 @@ BEGIN
         p_next_need,
         p_wait_for,
         p_available_at,
+        p_payload,
         jsonb_build_object('rescheduled_without_lease', TRUE)
     );
 END;

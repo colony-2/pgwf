@@ -268,6 +268,177 @@ func TestPayloadValidation(t *testing.T) {
 		).Scan(&jobID)
 		expectErrorContains(t, err, "payload exceeds 512 bytes")
 	})
+
+	t.Run("reschedule rejects non-object payload", func(t *testing.T) {
+		_, err := testDB.Exec(
+			`SELECT pgwf.submit_job($1, $2, $3, $4, $5)`,
+			"job-resched-invalid", "submitter", "cap.payload", pqStringArray(nil), `{"ok":true}`,
+		)
+		if err != nil {
+			t.Fatalf("submit_job: %v", err)
+		}
+
+		var jobID, leaseID string
+		if err := testDB.QueryRow(
+			`SELECT job_id, lease_id FROM pgwf.get_work($1, $2, $3, $4)`,
+			"worker-lease", pqStringArray([]string{"cap.payload"}), 30, 1,
+		).Scan(&jobID, &leaseID); err != nil {
+			t.Fatalf("get_work: %v", err)
+		}
+
+		err = testDB.QueryRow(
+			`SELECT job_id FROM pgwf.reschedule_job($1, $2, $3, $4, $5, NULL::timestamptz, $6)`,
+			jobID, leaseID, "worker-lease", "cap.other", pqStringArray(nil), `["oops"]`,
+		).Scan(&jobID)
+		expectErrorContains(t, err, "payload must be a JSON object")
+	})
+
+	t.Run("reschedule_unheld rejects oversized payload", func(t *testing.T) {
+		_, err := testDB.Exec(
+			`SELECT pgwf.submit_job($1, $2, $3, $4, $5)`,
+			"job-unheld-invalid", "submitter", "cap.payload", pqStringArray(nil), `{"ok":true}`,
+		)
+		if err != nil {
+			t.Fatalf("submit_job: %v", err)
+		}
+
+		bigPayload := fmt.Sprintf(`{"data":"%s"}`, strings.Repeat("b", 520))
+		var rescheduled string
+		err = testDB.QueryRow(
+			`SELECT job_id FROM pgwf.reschedule_unheld_job($1, $2, $3, $4, NULL::timestamptz, $5)`,
+			"job-unheld-invalid", "operator", "cap.other", pqStringArray(nil), bigPayload,
+		).Scan(&rescheduled)
+		expectErrorContains(t, err, "payload exceeds 512 bytes")
+	})
+}
+
+func TestPayloadRescheduleUpdates(t *testing.T) {
+	resetTables(t)
+
+	initial := `{"foo":"old"}`
+	updated := `{"foo":"new"}`
+
+	if _, err := testDB.Exec(
+		`SELECT pgwf.submit_job($1, $2, $3, $4, $5)`,
+		"job-resched-payload", "submitter", "cap.payload.resched", pqStringArray(nil), initial,
+	); err != nil {
+		t.Fatalf("submit_job: %v", err)
+	}
+
+	var jobID, leaseID string
+	if err := testDB.QueryRow(
+		`SELECT job_id, lease_id FROM pgwf.get_work($1, $2, $3, $4)`,
+		"worker-1", pqStringArray([]string{"cap.payload.resched"}), 30, 1,
+	).Scan(&jobID, &leaseID); err != nil {
+		t.Fatalf("get_work: %v", err)
+	}
+
+	var rescheduled string
+	if err := testDB.QueryRow(
+		`SELECT job_id FROM pgwf.reschedule_job($1, $2, $3, $4, $5, NULL::timestamptz, $6)`,
+		jobID, leaseID, "worker-1", "cap.payload.resched.next", pqStringArray(nil), updated,
+	).Scan(&rescheduled); err != nil {
+		t.Fatalf("reschedule_job: %v", err)
+	}
+	if rescheduled != jobID {
+		t.Fatalf("expected job-resched-payload, got %s", rescheduled)
+	}
+
+	var leasedJob, leasedLease string
+	var payloadOK bool
+	if err := testDB.QueryRow(
+		`SELECT job_id, lease_id, payload = $5::jsonb FROM pgwf.get_work($1, $2, $3, $4)`,
+		"worker-2", pqStringArray([]string{"cap.payload.resched.next"}), 30, 1, updated,
+	).Scan(&leasedJob, &leasedLease, &payloadOK); err != nil {
+		t.Fatalf("get_work after reschedule: %v", err)
+	}
+	if leasedJob != jobID {
+		t.Fatalf("expected %s, got %s", jobID, leasedJob)
+	}
+	if !payloadOK {
+		t.Fatalf("expected updated payload from get_work")
+	}
+
+	if _, err := testDB.Exec(`SELECT pgwf.complete_job($1, $2, $3)`, leasedJob, leasedLease, "worker-2"); err != nil {
+		t.Fatalf("complete_job: %v", err)
+	}
+
+	var archivedOK bool
+	if err := testDB.QueryRow(
+		`SELECT payload = $2::jsonb FROM pgwf.jobs_archive WHERE job_id = $1`,
+		jobID, updated,
+	).Scan(&archivedOK); err != nil {
+		t.Fatalf("verify archived payload: %v", err)
+	}
+	if !archivedOK {
+		t.Fatalf("archived payload does not match updated value")
+	}
+
+	var payloadKeys int
+	if err := testDB.QueryRow(
+		`SELECT count(*) FROM pgwf.jobs_trace WHERE job_id = $1 AND (COALESCE(input_data ? 'payload', FALSE) OR COALESCE(output_data ? 'payload', FALSE))`,
+		jobID,
+	).Scan(&payloadKeys); err != nil {
+		t.Fatalf("trace payload check: %v", err)
+	}
+	if payloadKeys != 0 {
+		t.Fatalf("expected payload to be excluded from traces, found %d entries", payloadKeys)
+	}
+}
+
+func TestPayloadUnheldRescheduleUpdates(t *testing.T) {
+	resetTables(t)
+
+	initial := `{"foo":"start"}`
+	updated := `{"foo":"updated"}`
+
+	if _, err := testDB.Exec(
+		`SELECT pgwf.submit_job($1, $2, $3, $4, $5)`,
+		"job-unheld-payload", "submitter", "cap.payload.unheld", pqStringArray(nil), initial,
+	); err != nil {
+		t.Fatalf("submit_job: %v", err)
+	}
+
+	var rescheduled string
+	if err := testDB.QueryRow(
+		`SELECT job_id FROM pgwf.reschedule_unheld_job($1, $2, $3, $4, NULL::timestamptz, $5)`,
+		"job-unheld-payload", "operator", "cap.payload.unheld.next", pqStringArray(nil), updated,
+	).Scan(&rescheduled); err != nil {
+		t.Fatalf("reschedule_unheld_job: %v", err)
+	}
+	if rescheduled != "job-unheld-payload" {
+		t.Fatalf("expected job-unheld-payload, got %s", rescheduled)
+	}
+
+	var jobID, leaseID string
+	var payloadOK bool
+	if err := testDB.QueryRow(
+		`SELECT job_id, lease_id, payload = $5::jsonb FROM pgwf.get_work($1, $2, $3, $4)`,
+		"worker-3", pqStringArray([]string{"cap.payload.unheld.next"}), 30, 1, updated,
+	).Scan(&jobID, &leaseID, &payloadOK); err != nil {
+		t.Fatalf("get_work after unheld reschedule: %v", err)
+	}
+	if jobID != "job-unheld-payload" {
+		t.Fatalf("expected job-unheld-payload, got %s", jobID)
+	}
+	if !payloadOK {
+		t.Fatalf("expected updated payload after unheld reschedule")
+	}
+
+	if _, err := testDB.Exec(`SELECT pgwf.complete_job($1, $2, $3)`, jobID, leaseID, "worker-3"); err != nil {
+		t.Fatalf("complete_job: %v", err)
+	}
+
+	var archivedOK bool
+	if err := testDB.QueryRow(
+		`SELECT payload = $2::jsonb FROM pgwf.jobs_archive WHERE job_id = $1`,
+		jobID, updated,
+	).Scan(&archivedOK); err != nil {
+		t.Fatalf("verify archived payload: %v", err)
+	}
+	if !archivedOK {
+		t.Fatalf("archived payload does not match updated value")
+	}
 }
 
 func TestSingletonPreventsConcurrentLease(t *testing.T) {
