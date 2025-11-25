@@ -411,7 +411,6 @@ CREATE OR REPLACE FUNCTION pgwf._reschedule_locked_job(
     p_worker_id TEXT,
     p_next_need TEXT,
     p_wait_for TEXT[] DEFAULT '{}'::TEXT[],
-    p_singleton_key TEXT DEFAULT NULL,
     p_available_at TIMESTAMPTZ DEFAULT clock_timestamp(),
     p_trace_context JSONB DEFAULT '{}'::JSONB
 )
@@ -429,7 +428,6 @@ BEGIN
     UPDATE pgwf.jobs j
     SET next_need = p_next_need,
         wait_for = v_wait_for,
-        singleton_key = p_singleton_key,
         available_at = v_available_at,
         consecutive_expirations = 0,
         lease_id = NULL,
@@ -455,12 +453,10 @@ BEGIN
             'worker_id', p_worker_id,
             'previous_next_need', p_locked_job.next_need,
             'previous_wait_for', p_locked_job.wait_for,
-            'previous_singleton_key', p_locked_job.singleton_key,
             'previous_available_at', p_locked_job.available_at,
             'previous_expires_at', p_locked_job.expires_at,
             'next_need', p_next_need,
             'wait_for', v_wait_for,
-            'singleton_key', p_singleton_key,
             'available_at', v_available_at,
             'expires_at', v_expires_at
         ) || COALESCE(p_trace_context, '{}'::JSONB),
@@ -855,7 +851,6 @@ CREATE OR REPLACE FUNCTION pgwf.reschedule_job(
     p_worker_id TEXT,
     p_next_need TEXT,
     p_wait_for TEXT[] DEFAULT '{}'::TEXT[],
-    p_singleton_key TEXT DEFAULT NULL,
     p_available_at TIMESTAMPTZ DEFAULT clock_timestamp()
 )
 RETURNS TABLE(job_id TEXT, next_need TEXT, wait_for TEXT[], available_at TIMESTAMPTZ)
@@ -883,7 +878,6 @@ BEGIN
         p_worker_id,
         p_next_need,
         p_wait_for,
-        p_singleton_key,
         p_available_at,
         jsonb_build_object('lease_id', p_lease_id)
     );
@@ -1128,7 +1122,6 @@ CREATE OR REPLACE FUNCTION pgwf.reschedule_unheld_job(
     p_worker_id TEXT,
     p_next_need TEXT,
     p_wait_for TEXT[] DEFAULT '{}'::TEXT[],
-    p_singleton_key TEXT DEFAULT NULL,
     p_available_at TIMESTAMPTZ DEFAULT clock_timestamp()
 )
 RETURNS TABLE(job_id TEXT, next_need TEXT, wait_for TEXT[], available_at TIMESTAMPTZ)
@@ -1157,7 +1150,6 @@ BEGIN
         p_worker_id,
         p_next_need,
         p_wait_for,
-        p_singleton_key,
         p_available_at,
         jsonb_build_object('rescheduled_without_lease', TRUE)
     );

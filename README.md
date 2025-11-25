@@ -15,8 +15,8 @@ pgwf (Postgres Workflow) is a pure-SQL workflow engine. It's built specifically 
 | `submit_job` | Inserts a new job, validates dependencies, attaches an optional payload, and (optionally) emits notifications for `next_need`. | `submit_job(job_id TEXT, worker_id TEXT, next_need TEXT, wait_for TEXT[], payload JSONB, singleton_key TEXT, available_at TIMESTAMPTZ, expires_at TIMESTAMPTZ)` |
 | `get_work`        | Leases up to `limit_jobs` that match the supplied capabilities, assigning a fresh `lease_id` and visibility timeout.   | `get_work(worker_id TEXT, worker_caps TEXT[], lease_seconds INT, limit_jobs INT)`                                                           |
 | `extend_lease`    | Heartbeats an active lease by pushing `lease_expires_at` into the future.                                              | `extend_lease(job_id TEXT, lease_id TEXT, worker_id TEXT, additional_seconds INT)`                                                          |
-| `reschedule_job`  | Returns a leased job to the queue with updated capability/dependency metadata and clears the lease.                    | `reschedule_job(job_id TEXT, lease_id TEXT, worker_id TEXT, next_need TEXT, wait_for TEXT[], singleton_key TEXT, available_at TIMESTAMPTZ)` |
-| `reschedule_unheld_job` | Mutates any `READY` job’s metadata/availability without first needing a lease.                                         | `reschedule_unheld_job(job_id TEXT, worker_id TEXT, next_need TEXT, wait_for TEXT[], singleton_key TEXT, available_at TIMESTAMPTZ)`         |
+| `reschedule_job`  | Returns a leased job to the queue with updated capability/dependency metadata and clears the lease.                    | `reschedule_job(job_id TEXT, lease_id TEXT, worker_id TEXT, next_need TEXT, wait_for TEXT[], available_at TIMESTAMPTZ)` |
+| `reschedule_unheld_job` | Mutates any `READY` job’s metadata/availability without first needing a lease.                                         | `reschedule_unheld_job(job_id TEXT, worker_id TEXT, next_need TEXT, wait_for TEXT[], available_at TIMESTAMPTZ)`         |
 | `complete_job`    | Archives the job, deletes it from `pgwf.jobs`, removes the job_id from dependents, and wakes listeners.                | `complete_job(job_id TEXT, lease_id TEXT, worker_id TEXT)`                                                                                  |
 | `complete_unheld_job` | Archives a `READY` job that locking and completing in a single op (and unblocking dependent work/notifying as needed). | `complete_unheld_job(job_id TEXT, worker_id TEXT)`                                                                                          |
 | `cancel_job` | Marks a job for cancellation, preventing additional leases, extensions, or reschedules while capturing who requested it. | `cancel_job(job_id TEXT, worker_id TEXT, reason TEXT)` |
@@ -111,6 +111,7 @@ Capabilities make it easy to run heterogeneous fleets (containers, serverless, h
 ### Singleton keys
 
 `singleton_key` is an optional mutex scope. If all “billing for customer-42” jobs share `singleton_key = 'customer-42'`, pgwf ensures only one job with that key holds a lease at any time. This prevents concurrent workflows from trampling shared resources without involving advisory locks or external coordination.
+The key is set (or left NULL) when the job is first submitted and remains immutable; reschedule helpers do not accept a singleton parameter.
 
 ### Wait-for semantics
 
@@ -196,6 +197,7 @@ If the transaction commits, both the invoice row and the workflow job become dur
         p_available_at  => clock_timestamp()
     );
     ```
+   The singleton key (if any) is fixed at submission time; subsequent reschedules do not accept or alter it.
 
 3. **Workers poll** – Workers call `pgwf.get_work(worker_id, worker_caps, lease_seconds, limit_jobs)` to lease jobs. When notifications are enabled they also `LISTEN pgwf.need.<capability>` to wake up instantly; otherwise they simply poll. Each lease returns full metadata plus a fresh `lease_id`. A “python” worker might perform ETL, while a “human-review” worker handles compliance later.
 4. **Process + heartbeat** – While running, workers use `pgwf.extend_lease(job_id, lease_id, worker_id, additional_seconds)` to keep ownership. If they expect a long pause, they can reschedule themselves with a future `available_at`.

@@ -301,6 +301,71 @@ func TestSingletonPreventsConcurrentLease(t *testing.T) {
 	}
 }
 
+func TestSingletonImmutabilityOnReschedule(t *testing.T) {
+	t.Run("lease reschedule preserves key", func(t *testing.T) {
+		resetTables(t)
+
+		if _, err := testDB.Exec(`SELECT pgwf.submit_job($1, $2, $3, $4, $5, $6)`, "job-single-held", "submitter", "cap.single", nil, nil, "key-held"); err != nil {
+			t.Fatalf("submit job-single-held: %v", err)
+		}
+
+		jobID, leaseID := leaseSingleJob(t, []string{"cap.single"})
+
+		var rescheduled string
+		if err := testDB.QueryRow(
+			`SELECT job_id FROM pgwf.reschedule_job($1, $2, $3, $4)`,
+			jobID, leaseID, "worker", "cap.single.next",
+		).Scan(&rescheduled); err != nil {
+			t.Fatalf("reschedule_job: %v", err)
+		}
+		if rescheduled != jobID {
+			t.Fatalf("expected job-single-held to reschedule, got %s", rescheduled)
+		}
+
+		var singleton sql.NullString
+		if err := testDB.QueryRow(`SELECT singleton_key FROM pgwf.jobs WHERE job_id = $1`, jobID).Scan(&singleton); err != nil {
+			t.Fatalf("query jobs singleton_key: %v", err)
+		}
+		if !singleton.Valid || singleton.String != "key-held" {
+			t.Fatalf("singleton_key should remain key-held, got %+v", singleton)
+		}
+
+		if err := testDB.QueryRow(`SELECT singleton_key FROM pgwf.jobs_with_status WHERE job_id = $1`, jobID).Scan(&singleton); err != nil {
+			t.Fatalf("query jobs_with_status singleton_key: %v", err)
+		}
+		if !singleton.Valid || singleton.String != "key-held" {
+			t.Fatalf("singleton_key in jobs_with_status should remain key-held, got %+v", singleton)
+		}
+	})
+
+	t.Run("unheld reschedule keeps null key", func(t *testing.T) {
+		resetTables(t)
+
+		if _, err := testDB.Exec(`SELECT pgwf.submit_job($1, $2, $3)`, "job-no-single", "submitter", "cap.no.single"); err != nil {
+			t.Fatalf("submit job-no-single: %v", err)
+		}
+
+		if _, err := testDB.Exec(`SELECT pgwf.reschedule_unheld_job($1, $2, $3)`, "job-no-single", "worker", "cap.no.single.next"); err != nil {
+			t.Fatalf("reschedule_unheld_job: %v", err)
+		}
+
+		var singleton sql.NullString
+		if err := testDB.QueryRow(`SELECT singleton_key FROM pgwf.jobs WHERE job_id = $1`, "job-no-single").Scan(&singleton); err != nil {
+			t.Fatalf("query jobs singleton_key after unheld reschedule: %v", err)
+		}
+		if singleton.Valid {
+			t.Fatalf("expected singleton_key to remain NULL after unheld reschedule, got %+v", singleton)
+		}
+
+		if err := testDB.QueryRow(`SELECT singleton_key FROM pgwf.jobs_with_status WHERE job_id = $1`, "job-no-single").Scan(&singleton); err != nil {
+			t.Fatalf("query jobs_with_status singleton_key after unheld reschedule: %v", err)
+		}
+		if singleton.Valid {
+			t.Fatalf("expected singleton_key to remain NULL in jobs_with_status after unheld reschedule, got %+v", singleton)
+		}
+	})
+}
+
 func TestDependencyRelease(t *testing.T) {
 	resetTables(t)
 
@@ -380,8 +445,8 @@ func TestExtendLeaseAndReschedule(t *testing.T) {
 	}
 
 	err = testDB.QueryRow(
-		`SELECT job_id FROM pgwf.reschedule_job($1, $2, $3, $4, $5, $6, $7)`,
-		jobID, leaseID, "worker", "cap.delta", pqStringArray([]string{}), nil, time.Now(),
+		`SELECT job_id FROM pgwf.reschedule_job($1, $2, $3, $4, $5, $6)`,
+		jobID, leaseID, "worker", "cap.delta", pqStringArray([]string{}), time.Now(),
 	).Scan(&jobID)
 	if err != nil {
 		t.Fatalf("reschedule failed: %v", err)
@@ -507,8 +572,8 @@ func TestLeaseValidationErrors(t *testing.T) {
 	t.Run("reschedule without lease", func(t *testing.T) {
 		var jobID string
 		err := testDB.QueryRow(
-			`SELECT job_id FROM pgwf.reschedule_job($1, $2, $3, $4, $5, $6, $7)`,
-			"job-err", "missing", "worker", "cap.err", pqStringArray(nil), nil, time.Now(),
+			`SELECT job_id FROM pgwf.reschedule_job($1, $2, $3, $4, $5, $6)`,
+			"job-err", "missing", "worker", "cap.err", pqStringArray(nil), time.Now(),
 		).Scan(&jobID)
 		expectErrorContains(t, err, "is not currently leased")
 	})
@@ -1000,8 +1065,8 @@ func TestExpiredJobsSkipLeasing(t *testing.T) {
 
 	var rescheduled string
 	err := testDB.QueryRow(
-		`SELECT job_id FROM pgwf.reschedule_unheld_job($1, $2, $3, $4, $5, $6)`,
-		"job-expired", "operator", "cap.expired.new", pqStringArray([]string{}), nil, time.Now().UTC(),
+		`SELECT job_id FROM pgwf.reschedule_unheld_job($1, $2, $3, $4, $5)`,
+		"job-expired", "operator", "cap.expired.new", pqStringArray([]string{}), time.Now().UTC(),
 	).Scan(&rescheduled)
 	if err != nil {
 		t.Fatalf("reschedule expired job: %v", err)
@@ -1217,14 +1282,14 @@ func TestRescheduleWaitForValidation(t *testing.T) {
 
 	var dummy string
 	err := testDB.QueryRow(
-		`SELECT job_id FROM pgwf.reschedule_job($1, $2, $3, $4, $5, $6, $7)`,
-		jobID, leaseID, "worker", "cap.target", pqStringArray([]string{"unknown"}), nil, time.Now(),
+		`SELECT job_id FROM pgwf.reschedule_job($1, $2, $3, $4, $5, $6)`,
+		jobID, leaseID, "worker", "cap.target", pqStringArray([]string{"unknown"}), time.Now(),
 	).Scan(&dummy)
 	expectErrorContains(t, err, "wait_for references unknown jobs")
 
 	err = testDB.QueryRow(
-		`SELECT job_id FROM pgwf.reschedule_job($1, $2, $3, $4, $5, $6, $7)`,
-		jobID, leaseID, "worker", "cap.target", pqStringArray([]string{"dep-resched", "dep-old"}), nil, time.Now(),
+		`SELECT job_id FROM pgwf.reschedule_job($1, $2, $3, $4, $5, $6)`,
+		jobID, leaseID, "worker", "cap.target", pqStringArray([]string{"dep-resched", "dep-old"}), time.Now(),
 	).Scan(&dummy)
 	if err != nil {
 		t.Fatalf("reschedule with filtered wait_for: %v", err)
@@ -1253,8 +1318,8 @@ func TestRescheduleAllowsActiveDependency(t *testing.T) {
 
 	var rescheduled string
 	if err := testDB.QueryRow(
-		`SELECT job_id FROM pgwf.reschedule_job($1, $2, $3, $4, $5, $6, $7)`,
-		jobID, leaseID, "worker-target", "cap.target", pqStringArray([]string{"dep-active-resched"}), nil, time.Now(),
+		`SELECT job_id FROM pgwf.reschedule_job($1, $2, $3, $4, $5, $6)`,
+		jobID, leaseID, "worker-target", "cap.target", pqStringArray([]string{"dep-active-resched"}), time.Now(),
 	).Scan(&rescheduled); err != nil {
 		t.Fatalf("reschedule target: %v", err)
 	}
@@ -1326,8 +1391,8 @@ func TestRescheduleUnheldJob(t *testing.T) {
 
 	rows, err := testDB.Query(`
         SELECT job_id, next_need
-        FROM pgwf.reschedule_unheld_job($1, $2, $3, $4, $5, $6)
-    `, "job-free", "worker", "cap.theta", nil, "single", time.Now().Add(time.Hour))
+        FROM pgwf.reschedule_unheld_job($1, $2, $3, $4, $5)
+    `, "job-free", "worker", "cap.theta", nil, time.Now().Add(time.Hour))
 	if err != nil {
 		t.Fatalf("reschedule_unheld_job: %v", err)
 	}
