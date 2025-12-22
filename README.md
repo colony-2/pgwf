@@ -86,7 +86,7 @@ The workflow engine patterns here are inspired in part by durable execution syst
 
 ### Cancellation Lifecycle
 
-Operators can call `pgwf.cancel_job` to mark in-flight or queued work for cancellation. Once a cancelled job’s lease expires (or if it was `READY`/`PENDING_JOBS`), it transitions to the `CANCELLED` status so it no longer leases, emits notifications, or blocks dependent work from progressing. The `pgwf.archive_cancelled_jobs` function performs bulk archival of these rows, drops the cancelled job_ids from any `wait_for` arrays, and appends both per-job (`job_cancel_archived`) and aggregate (`job_cancel_archived_run`) trace events. When the `pg_cron` extension is available, the schema automatically schedules `SELECT pgwf.archive_cancelled_jobs('pgwf-cron', 500);` to run every minute so cancelled rows are reclaimed without external automation. Environments without `pg_cron` can invoke the same function manually or via their own scheduler.
+Operators can call `pgwf.cancel_job` to mark in-flight or queued work for cancellation. Once a cancelled job's lease expires (or if it was `READY`/`PENDING_JOBS`), it transitions to the `CANCELLED` status so it no longer leases, emits notifications, or blocks dependent work from progressing. The `pgwf.archive_cancelled_jobs` function performs bulk archival of these rows, drops the cancelled job_ids from any `wait_for` arrays, and appends both per-job (`job_cancel_archived`) and aggregate (`job_cancel_archived_run`) trace events. Applications should invoke this function periodically (manually or via their own scheduler) to reclaim cancelled rows.
 
 ### Lease IDs
 

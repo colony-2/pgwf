@@ -9,7 +9,6 @@
 ## Schema Changes
 - Extend `pgwf.jobs` with `cancel_requested BOOLEAN NOT NULL DEFAULT FALSE`, `cancel_requested_by TEXT`, and `cancel_requested_at TIMESTAMPTZ` so we can durably mark a job for cancellation and capture who/when the request was made (`pgwf.sql:11-20`).
 - Mirror the three columns in `pgwf.jobs_archive` so the archive records whether a job finished normally or via cancellation and when that decision was recorded (`pgwf.sql:22-30`).
-- Enable the `pg_cron` extension alongside `pgcrypto` so pgwf installations can schedule recurring maintenance work without extra infrastructure.
 - Update `pgwf.jobs_with_status` so cancelled-but-not-active rows report `status = 'CANCELLED'` ahead of the READY/PENDING/AWAITING cases, while actively leased rows continue to report `ACTIVE` until their lease expires; expose `cancel_requested_at` in the select list for downstream consumers.
 - Update `pgwf.jobs_friendly_status` to include the new `CANCELLED` state (with `cancelled_at`/`cancelled_by` columns) so dashboards can display who issued the cancel request (`pgwf.sql:53-61`).
 
@@ -26,7 +25,6 @@
 - Return only the number of archived jobs (an integer), raising if no worker_id is supplied (mirrors existing functions). Include that count in the `'job_cancel_archived'` trace event so operators can audit sweep volume without per-row entries, and collect aggregate metrics (duration, limit, count) for observability.
 - When archiving, populate the new cancel columns in `pgwf.jobs_archive`, and store an output JSON blob in the trace event with the aggregate metadata for auditing.
 - Document that operators should invoke `archive_cancelled_jobs` periodically (or after issuing `cancel_job`) to reclaim rows; the function is idempotent because it skips jobs once they leave the live table.
-- Use `pg_cron` to create a scheduled job (e.g., `SELECT cron.schedule('pgwf_archive_cancelled', '* * * * *', $$SELECT pgwf.archive_cancelled_jobs('pgwf-cron', 500);$$)`) that runs every 60 seconds, ensuring cancelled jobs are archived automatically even if no external sweeper is deployed.
 
 ## Trace & Notifications
 - Emit a `'job_cancel_requested'` event from `cancel_job` via `_emit_trace_event` (`pgwf.sql:120-175`), recording `job_id`, `worker_id`, optional `p_reason`, and whether the job was ACTIVE at request time.

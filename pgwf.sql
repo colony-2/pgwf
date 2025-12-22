@@ -6,16 +6,6 @@ SET search_path = pgwf, public;
 
 CREATE EXTENSION IF NOT EXISTS pgcrypto;
 
-DO $pgwf$
-BEGIN
-    IF EXISTS (SELECT 1 FROM pg_catalog.pg_available_extensions WHERE name = 'pg_cron') THEN
-        EXECUTE 'CREATE EXTENSION IF NOT EXISTS pg_cron';
-    ELSE
-        RAISE NOTICE 'pg_cron extension not available; skipping automatic cancellation archival';
-    END IF;
-END;
-$pgwf$;
-
 CREATE SEQUENCE IF NOT EXISTS pgwf.jobs_trace_id_seq;
 
 CREATE TABLE IF NOT EXISTS pgwf.jobs (
@@ -1172,32 +1162,5 @@ BEGIN
     );
 END;
 $$;
-
-DO $pgwf$
-DECLARE
-    v_job_id INTEGER;
-BEGIN
-    IF EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'pg_cron') THEN
-        BEGIN
-            FOR v_job_id IN
-                SELECT jobid FROM cron.job WHERE jobname = 'pgwf_archive_cancelled'
-            LOOP
-                PERFORM cron.unschedule(v_job_id);
-            END LOOP;
-
-            PERFORM cron.schedule(
-                'pgwf_archive_cancelled',
-                '* * * * *',
-                $$SELECT pgwf.archive_cancelled_jobs('pgwf-cron', 500);$$
-            );
-        EXCEPTION
-            WHEN undefined_table THEN
-                RAISE NOTICE 'pg_cron catalog not ready; skipping schedule';
-            WHEN undefined_function THEN
-                RAISE NOTICE 'pg_cron scheduling functions unavailable; skipping schedule';
-        END;
-    END IF;
-END;
-$pgwf$;
 
 COMMIT;
