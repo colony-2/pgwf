@@ -9,7 +9,8 @@ CREATE EXTENSION IF NOT EXISTS pgcrypto;
 CREATE SEQUENCE IF NOT EXISTS pgwf.jobs_trace_id_seq;
 
 CREATE TABLE IF NOT EXISTS pgwf.jobs (
-    job_id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL,
+    job_id TEXT NOT NULL,
     next_need TEXT NOT NULL,
     wait_for TEXT[] NOT NULL DEFAULT '{}'::TEXT[],
     payload JSONB NOT NULL DEFAULT '{}'::JSONB,
@@ -24,13 +25,15 @@ CREATE TABLE IF NOT EXISTS pgwf.jobs (
     cancel_requested BOOLEAN NOT NULL DEFAULT FALSE,
     cancel_requested_by TEXT,
     cancel_requested_at TIMESTAMPTZ,
+    PRIMARY KEY (tenant_id, job_id),
     CONSTRAINT jobs_payload_is_object CHECK (jsonb_typeof(payload) = 'object'),
     CONSTRAINT jobs_payload_size_limit CHECK (pg_column_size(payload) <= 512)
 );
 
 CREATE TABLE IF NOT EXISTS pgwf.jobs_archive (
     archived_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
-    job_id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL,
+    job_id TEXT NOT NULL,
     next_need TEXT NOT NULL,
     wait_for TEXT[] NOT NULL DEFAULT '{}'::TEXT[],
     payload JSONB NOT NULL DEFAULT '{}'::JSONB,
@@ -43,12 +46,14 @@ CREATE TABLE IF NOT EXISTS pgwf.jobs_archive (
     cancel_requested BOOLEAN NOT NULL DEFAULT FALSE,
     cancel_requested_by TEXT,
     cancel_requested_at TIMESTAMPTZ,
+    PRIMARY KEY (tenant_id, job_id),
     CONSTRAINT jobs_archive_payload_is_object CHECK (jsonb_typeof(payload) = 'object'),
     CONSTRAINT jobs_archive_payload_size_limit CHECK (pg_column_size(payload) <= 512)
 );
 
 CREATE TABLE IF NOT EXISTS pgwf.jobs_trace (
     trace_id BIGINT PRIMARY KEY DEFAULT nextval('pgwf.jobs_trace_id_seq'),
+    tenant_id TEXT NOT NULL,
     job_id TEXT NOT NULL,
     event_type TEXT NOT NULL,
     worker_id TEXT NOT NULL,
@@ -56,6 +61,26 @@ CREATE TABLE IF NOT EXISTS pgwf.jobs_trace (
     input_data JSONB NOT NULL,
     output_data JSONB
 );
+
+-- Performance indexes for multi-tenant operations
+CREATE INDEX IF NOT EXISTS idx_jobs_tenant_ready_work
+ON pgwf.jobs(tenant_id, next_need, created_at)
+WHERE NOT cancel_requested;
+
+CREATE INDEX IF NOT EXISTS idx_jobs_tenant_active_singleton
+ON pgwf.jobs(tenant_id, singleton_key)
+WHERE singleton_key IS NOT NULL;
+
+CREATE INDEX IF NOT EXISTS idx_jobs_tenant_waitfor
+ON pgwf.jobs(tenant_id, job_id)
+INCLUDE (wait_for);
+
+CREATE INDEX IF NOT EXISTS idx_jobs_tenant_cancelled
+ON pgwf.jobs(tenant_id, created_at)
+WHERE cancel_requested = TRUE;
+
+CREATE INDEX IF NOT EXISTS idx_trace_tenant_job_event
+ON pgwf.jobs_trace(tenant_id, job_id, event_at DESC);
 
 CREATE OR REPLACE FUNCTION pgwf.crash_concern_threshold()
 RETURNS INTEGER
@@ -89,7 +114,16 @@ SELECT
         WHEN j.lease_expires_at > clock_timestamp() THEN 'ACTIVE'
         WHEN j.cancel_requested THEN 'CANCELLED'
         WHEN j.available_at > clock_timestamp() THEN 'AWAITING_FUTURE'
-        WHEN COALESCE(array_length(j.wait_for, 1), 0) > 0 THEN 'PENDING_JOBS'
+        WHEN EXISTS (
+            SELECT 1
+            FROM unnest(j.wait_for) AS dep_job_id
+            WHERE NOT EXISTS (
+                SELECT 1
+                FROM pgwf.jobs_archive ja
+                WHERE ja.tenant_id = j.tenant_id
+                  AND ja.job_id = dep_job_id
+            )
+        ) THEN 'PENDING_JOBS'
         WHEN j.consecutive_expirations >= pgwf.crash_concern_threshold() THEN 'CRASH_CONCERN'
         WHEN j.expires_at <= clock_timestamp() THEN 'EXPIRED'
         ELSE 'READY'
@@ -98,6 +132,7 @@ FROM pgwf.jobs j;
 
 CREATE OR REPLACE VIEW pgwf.jobs_friendly_status AS
 SELECT
+    jws.tenant_id,
     jws.job_id,
     jws.status,
     jws.created_at AS creation_dt,
@@ -161,6 +196,7 @@ END;
 $$;
 
 CREATE OR REPLACE FUNCTION pgwf._lock_job_for_status(
+    p_tenant_id TEXT,
     p_job_id TEXT,
     p_status TEXT,
     p_expected_lease_id TEXT DEFAULT NULL,
@@ -172,6 +208,9 @@ AS $$
 DECLARE
     v_row pgwf.jobs_with_status%ROWTYPE;
 BEGIN
+    IF p_tenant_id IS NULL THEN
+        RAISE EXCEPTION 'tenant_id cannot be NULL';
+    END IF;
     IF p_job_id IS NULL THEN
         RAISE EXCEPTION 'job_id cannot be NULL';
     END IF;
@@ -179,7 +218,8 @@ BEGIN
     SELECT *
     INTO v_row
     FROM pgwf.jobs_with_status
-    WHERE job_id = p_job_id
+    WHERE tenant_id = p_tenant_id
+      AND job_id = p_job_id
       AND (
           status = p_status
           OR (p_status = 'READY' AND status IN ('CRASH_CONCERN', 'EXPIRED'))
@@ -188,7 +228,7 @@ BEGIN
     FOR UPDATE;
 
     IF NOT FOUND THEN
-        RAISE EXCEPTION '%', COALESCE(p_missing_message, format('job %s is not in a valid status (%s requested)', p_job_id, p_status));
+        RAISE EXCEPTION '%', COALESCE(p_missing_message, format('job %s/%s is not in a valid status (%s requested)', p_tenant_id, p_job_id, p_status));
     END IF;
 
     RETURN v_row;
@@ -214,6 +254,7 @@ END;
 $$;
 
 CREATE OR REPLACE FUNCTION pgwf._emit_trace_event(
+    p_tenant_id TEXT,
     p_job_id TEXT,
     p_event_type TEXT,
     p_worker_id TEXT,
@@ -228,8 +269,9 @@ BEGIN
         RETURN;
     END IF;
 
-    INSERT INTO pgwf.jobs_trace (job_id, event_type, worker_id, input_data, output_data)
+    INSERT INTO pgwf.jobs_trace (tenant_id, job_id, event_type, worker_id, input_data, output_data)
     VALUES (
+        p_tenant_id,
         p_job_id,
         p_event_type,
         p_worker_id,
@@ -249,6 +291,7 @@ DECLARE
     v_archive pgwf.jobs_archive%ROWTYPE;
 BEGIN
     INSERT INTO pgwf.jobs_archive (
+        tenant_id,
         job_id,
         next_need,
         wait_for,
@@ -264,6 +307,7 @@ BEGIN
         cancel_requested_at
     )
     VALUES (
+        p_locked_job.tenant_id,
         p_locked_job.job_id,
         p_locked_job.next_need,
         p_locked_job.wait_for,
@@ -281,13 +325,15 @@ BEGIN
     RETURNING * INTO v_archive;
 
     DELETE FROM pgwf.jobs
-    WHERE job_id = p_locked_job.job_id;
+    WHERE tenant_id = p_locked_job.tenant_id
+      AND job_id = p_locked_job.job_id;
 
     RETURN v_archive;
 END;
 $$;
 
 CREATE OR REPLACE FUNCTION pgwf._update_waiters_for_completion_bulk(
+    p_tenant_id TEXT,
     p_completed_jobs TEXT[]
 )
 RETURNS TABLE(job_id TEXT, next_need TEXT, became_unblocked BOOLEAN)
@@ -305,11 +351,12 @@ BEGIN
         WITH targets AS (
             SELECT j.*
             FROM pgwf.jobs j
-            WHERE EXISTS (
-                SELECT 1
-                FROM unnest(j.wait_for) pending(job_id)
-                WHERE pending.job_id = ANY(p_completed_jobs)
-            )
+            WHERE j.tenant_id = p_tenant_id
+              AND EXISTS (
+                  SELECT 1
+                  FROM unnest(j.wait_for) pending(job_id)
+                  WHERE pending.job_id = ANY(p_completed_jobs)
+              )
             FOR UPDATE
         ),
         updated AS (
@@ -321,7 +368,8 @@ BEGIN
                   AND NOT (pending.val = ANY(p_completed_jobs))
             )
             FROM targets t
-            WHERE j.job_id = t.job_id
+            WHERE j.tenant_id = t.tenant_id
+              AND j.job_id = t.job_id
             RETURNING
                 j.job_id,
                 j.next_need,
@@ -349,6 +397,7 @@ END;
 $$;
 
 CREATE OR REPLACE FUNCTION pgwf._update_waiters_for_completion(
+    p_tenant_id TEXT,
     p_completed_job_id TEXT
 )
 RETURNS TABLE(job_id TEXT, next_need TEXT, became_unblocked BOOLEAN)
@@ -361,7 +410,7 @@ BEGIN
 
     RETURN QUERY
     SELECT *
-    FROM pgwf._update_waiters_for_completion_bulk(ARRAY[p_completed_job_id]);
+    FROM pgwf._update_waiters_for_completion_bulk(p_tenant_id, ARRAY[p_completed_job_id]);
 END;
 $$;
 
@@ -379,13 +428,15 @@ BEGIN
     p_locked_job.consecutive_expirations := 0;
     v_archive := pgwf._archive_and_delete_job(p_locked_job);
 
-    PERFORM pgwf._update_waiters_for_completion(p_locked_job.job_id);
+    PERFORM pgwf._update_waiters_for_completion(p_locked_job.tenant_id, p_locked_job.job_id);
 
     PERFORM pgwf._emit_trace_event(
+        p_locked_job.tenant_id,
         p_locked_job.job_id,
         'job_finished',
         p_worker_id,
         jsonb_build_object(
+            'tenant_id', p_locked_job.tenant_id,
             'job_id', p_locked_job.job_id,
             'worker_id', p_worker_id
         ) || COALESCE(p_trace_context, '{}'::JSONB),
@@ -415,7 +466,7 @@ DECLARE
     v_now TIMESTAMPTZ := clock_timestamp();
     v_payload JSONB := COALESCE(p_payload, p_locked_job.payload);
 BEGIN
-    v_wait_for := pgwf.normalize_wait_for(p_wait_for);
+    v_wait_for := pgwf.normalize_wait_for(p_locked_job.tenant_id, p_wait_for);
 
     IF p_payload IS NOT NULL THEN
         IF jsonb_typeof(p_payload) IS DISTINCT FROM 'object' THEN
@@ -435,7 +486,8 @@ BEGIN
         consecutive_expirations = 0,
         lease_id = NULL,
         lease_expires_at = '-infinity'
-    WHERE j.job_id = p_locked_job.job_id
+    WHERE j.tenant_id = p_locked_job.tenant_id
+      AND j.job_id = p_locked_job.job_id
     RETURNING j.job_id,
               j.next_need,
               j.wait_for,
@@ -448,10 +500,12 @@ BEGIN
     END IF;
 
     PERFORM pgwf._emit_trace_event(
+        p_locked_job.tenant_id,
         job_id,
         'reschedule_job',
         p_worker_id,
         jsonb_build_object(
+            'tenant_id', p_locked_job.tenant_id,
             'job_id', p_locked_job.job_id,
             'worker_id', p_worker_id,
             'previous_next_need', p_locked_job.next_need,
@@ -476,7 +530,7 @@ BEGIN
 END;
 $$;
 
-CREATE OR REPLACE FUNCTION pgwf.normalize_wait_for(p_wait_for TEXT[])
+CREATE OR REPLACE FUNCTION pgwf.normalize_wait_for(p_tenant_id TEXT, p_wait_for TEXT[])
 RETURNS TEXT[]
 LANGUAGE plpgsql
 AS $$
@@ -501,11 +555,11 @@ BEGIN
             FILTER (WHERE j.job_id IS NULL AND ja.job_id IS NULL)
     INTO v_clean, v_missing
     FROM ordered o
-    LEFT JOIN pgwf.jobs j ON j.job_id = o.job_id
-    LEFT JOIN pgwf.jobs_archive ja ON ja.job_id = o.job_id;
+    LEFT JOIN pgwf.jobs j ON j.tenant_id = p_tenant_id AND j.job_id = o.job_id
+    LEFT JOIN pgwf.jobs_archive ja ON ja.tenant_id = p_tenant_id AND ja.job_id = o.job_id;
 
     IF v_missing IS NOT NULL THEN
-        RAISE EXCEPTION 'wait_for references unknown jobs: %', v_missing;
+        RAISE EXCEPTION 'wait_for references unknown jobs in tenant %: %', p_tenant_id, v_missing;
     END IF;
 
     RETURN v_clean;
@@ -513,6 +567,7 @@ END;
 $$;
 
 CREATE OR REPLACE FUNCTION pgwf.submit_job(
+    p_tenant_id TEXT,
     p_job_id TEXT,
     p_worker_id TEXT,
     p_next_need TEXT,
@@ -522,7 +577,7 @@ CREATE OR REPLACE FUNCTION pgwf.submit_job(
     p_available_at TIMESTAMPTZ DEFAULT clock_timestamp(),
     p_expires_at TIMESTAMPTZ DEFAULT NULL
 )
-RETURNS TABLE(job_id TEXT, next_need TEXT, wait_for TEXT[], payload JSONB, available_at TIMESTAMPTZ)
+RETURNS TABLE(tenant_id TEXT, job_id TEXT, next_need TEXT, wait_for TEXT[], payload JSONB, available_at TIMESTAMPTZ)
 LANGUAGE plpgsql
 AS $$
 DECLARE
@@ -533,11 +588,15 @@ DECLARE
     v_now TIMESTAMPTZ := clock_timestamp();
     v_payload JSONB := COALESCE(p_payload, '{}'::JSONB);
 BEGIN
-    IF EXISTS (SELECT 1 FROM pgwf.jobs_archive ja WHERE ja.job_id = p_job_id) THEN
-        RAISE EXCEPTION 'job_id % has already completed and cannot be resubmitted', p_job_id;
+    IF p_tenant_id IS NULL THEN
+        RAISE EXCEPTION 'tenant_id cannot be NULL';
     END IF;
 
-    v_wait_for := pgwf.normalize_wait_for(p_wait_for);
+    IF EXISTS (SELECT 1 FROM pgwf.jobs_archive ja WHERE ja.tenant_id = p_tenant_id AND ja.job_id = p_job_id) THEN
+        RAISE EXCEPTION 'job_id %/% has already completed and cannot be resubmitted', p_tenant_id, p_job_id;
+    END IF;
+
+    v_wait_for := pgwf.normalize_wait_for(p_tenant_id, p_wait_for);
 
     IF jsonb_typeof(v_payload) IS DISTINCT FROM 'object' THEN
         RAISE EXCEPTION 'payload must be a JSON object';
@@ -547,20 +606,22 @@ BEGIN
         RAISE EXCEPTION 'payload exceeds 512 bytes';
     END IF;
 
-    INSERT INTO pgwf.jobs (job_id, next_need, wait_for, payload, singleton_key, available_at, expires_at)
-    VALUES (p_job_id, p_next_need, v_wait_for, v_payload, p_singleton_key, v_effective_available, v_expires_at)
-    RETURNING pgwf.jobs.job_id, pgwf.jobs.next_need, pgwf.jobs.wait_for, pgwf.jobs.payload, pgwf.jobs.available_at, pgwf.jobs.cancel_requested
-    INTO job_id, next_need, wait_for, payload, available_at, v_cancel_requested;
+    INSERT INTO pgwf.jobs (tenant_id, job_id, next_need, wait_for, payload, singleton_key, available_at, expires_at)
+    VALUES (p_tenant_id, p_job_id, p_next_need, v_wait_for, v_payload, p_singleton_key, v_effective_available, v_expires_at)
+    RETURNING pgwf.jobs.tenant_id, pgwf.jobs.job_id, pgwf.jobs.next_need, pgwf.jobs.wait_for, pgwf.jobs.payload, pgwf.jobs.available_at, pgwf.jobs.cancel_requested
+    INTO tenant_id, job_id, next_need, wait_for, payload, available_at, v_cancel_requested;
 
     IF NOT v_cancel_requested AND v_expires_at > v_now THEN
         PERFORM pgwf._notify_need(next_need, job_id);
     END IF;
 
     PERFORM pgwf._emit_trace_event(
+        p_tenant_id,
         p_job_id,
         'job_submitted',
         p_worker_id,
         jsonb_build_object(
+            'tenant_id', p_tenant_id,
             'job_id', p_job_id,
             'worker_id', p_worker_id,
             'next_need', p_next_need,
@@ -570,6 +631,7 @@ BEGIN
             'expires_at', v_expires_at
         ),
         jsonb_build_object(
+            'tenant_id', tenant_id,
             'job_id', job_id,
             'next_need', next_need,
             'wait_for', wait_for,
@@ -583,6 +645,7 @@ END;
 $$;
 
 CREATE OR REPLACE FUNCTION pgwf.cancel_job(
+    p_tenant_id TEXT,
     p_job_id TEXT,
     p_worker_id TEXT,
     p_reason TEXT DEFAULT NULL
@@ -594,6 +657,9 @@ DECLARE
     v_job pgwf.jobs%ROWTYPE;
     v_now TIMESTAMPTZ := clock_timestamp();
 BEGIN
+    IF p_tenant_id IS NULL THEN
+        RAISE EXCEPTION 'tenant_id cannot be NULL';
+    END IF;
     IF p_job_id IS NULL THEN
         RAISE EXCEPTION 'job_id cannot be NULL';
     END IF;
@@ -604,22 +670,25 @@ BEGIN
     SELECT *
     INTO v_job
     FROM pgwf.jobs
-    WHERE job_id = p_job_id
+    WHERE tenant_id = p_tenant_id
+      AND job_id = p_job_id
     FOR UPDATE;
 
     IF NOT FOUND THEN
-        IF EXISTS (SELECT 1 FROM pgwf.jobs_archive WHERE job_id = p_job_id) THEN
-            RAISE EXCEPTION 'job_id % has already completed and cannot be cancelled', p_job_id;
+        IF EXISTS (SELECT 1 FROM pgwf.jobs_archive WHERE tenant_id = p_tenant_id AND job_id = p_job_id) THEN
+            RAISE EXCEPTION 'job_id %/% has already completed and cannot be cancelled', p_tenant_id, p_job_id;
         END IF;
-        RAISE EXCEPTION 'job_id % does not exist', p_job_id;
+        RAISE EXCEPTION 'job_id %/% does not exist', p_tenant_id, p_job_id;
     END IF;
 
     IF v_job.cancel_requested THEN
         PERFORM pgwf._emit_trace_event(
+            p_tenant_id,
             p_job_id,
             'job_cancel_requested',
             p_worker_id,
             jsonb_build_object(
+                'tenant_id', p_tenant_id,
                 'job_id', p_job_id,
                 'worker_id', p_worker_id,
                 'reason', p_reason,
@@ -634,14 +703,17 @@ BEGIN
     SET cancel_requested = TRUE,
         cancel_requested_by = p_worker_id,
         cancel_requested_at = v_now
-    WHERE job_id = p_job_id
+    WHERE tenant_id = p_tenant_id
+      AND job_id = p_job_id
     RETURNING * INTO v_job;
 
     PERFORM pgwf._emit_trace_event(
+        p_tenant_id,
         p_job_id,
         'job_cancel_requested',
         p_worker_id,
         jsonb_build_object(
+            'tenant_id', p_tenant_id,
             'job_id', p_job_id,
             'worker_id', p_worker_id,
             'reason', p_reason,
@@ -656,10 +728,12 @@ $$;
 CREATE OR REPLACE FUNCTION pgwf.get_work(
     p_worker_id TEXT,
     p_worker_caps TEXT[],
+    p_tenant_ids TEXT[] DEFAULT NULL,
     p_lease_seconds INTEGER DEFAULT 60,
     p_limit_jobs INTEGER DEFAULT 1
 )
 RETURNS TABLE(
+    tenant_id TEXT,
     job_id TEXT,
     lease_id TEXT,
     next_need TEXT,
@@ -677,6 +751,7 @@ DECLARE
     v_expires TIMESTAMPTZ;
     v_count INTEGER := 0;
     v_cap TEXT;
+    v_tenant_id TEXT;
     v_previous_lease_id TEXT;
     v_previous_lease_expires_at TIMESTAMPTZ;
     v_previous_lease_expired BOOLEAN;
@@ -697,7 +772,7 @@ BEGIN
 
     v_expires := v_now + make_interval(secs => p_lease_seconds);
 
-    FOR job_id, lease_id, next_need, singleton_key, wait_for, payload, available_at, lease_expires_at,
+    FOR v_tenant_id, job_id, lease_id, next_need, singleton_key, wait_for, payload, available_at, lease_expires_at,
         v_previous_lease_id, v_previous_lease_expires_at, v_previous_lease_expired,
         v_total_expirations, v_consecutive_expirations IN
         WITH candidates AS (
@@ -706,11 +781,13 @@ BEGIN
             FROM pgwf.jobs_with_status jws
             WHERE jws.status = 'READY'
               AND jws.next_need = ANY(v_caps)
+              AND (p_tenant_ids IS NULL OR array_length(p_tenant_ids, 1) IS NULL OR jws.tenant_id = ANY(p_tenant_ids))
               AND (
                   jws.singleton_key IS NULL OR NOT EXISTS (
                       SELECT 1
                       FROM pgwf.jobs_with_status other
-                      WHERE other.singleton_key = jws.singleton_key
+                      WHERE other.tenant_id = jws.tenant_id
+                        AND other.singleton_key = jws.singleton_key
                         AND other.status = 'ACTIVE'
                   )
               )
@@ -731,8 +808,10 @@ BEGIN
             lease_id = gen_random_uuid()::TEXT,
             lease_expires_at = v_expires
         FROM candidates c
-        WHERE j.job_id = c.job_id
-        RETURNING j.job_id,
+        WHERE j.tenant_id = c.tenant_id
+          AND j.job_id = c.job_id
+        RETURNING j.tenant_id,
+                  j.job_id,
                   j.lease_id,
                   j.next_need,
                   j.singleton_key,
@@ -749,10 +828,12 @@ BEGIN
 
         IF v_previous_lease_expired THEN
             PERFORM pgwf._emit_trace_event(
+                v_tenant_id,
                 job_id,
                 'lease_expiration_counter_incremented',
                 p_worker_id,
                 jsonb_build_object(
+                    'tenant_id', v_tenant_id,
                     'worker_id', p_worker_id,
                     'worker_caps', v_caps,
                     'previous_lease_id', v_previous_lease_id,
@@ -766,12 +847,15 @@ BEGIN
         v_count := v_count + 1;
 
         PERFORM pgwf._emit_trace_event(
+            v_tenant_id,
             job_id,
             'job_retrieved',
             p_worker_id,
             jsonb_build_object(
+                'tenant_id', v_tenant_id,
                 'worker_id', p_worker_id,
                 'worker_caps', v_caps,
+                'tenant_ids', p_tenant_ids,
                 'lease_seconds', p_lease_seconds,
                 'limit_jobs', p_limit_jobs
             ),
@@ -781,6 +865,7 @@ BEGIN
             )
         );
 
+        tenant_id := v_tenant_id;
         RETURN NEXT;
     END LOOP;
 
@@ -794,6 +879,7 @@ END;
 $$;
 
 CREATE OR REPLACE FUNCTION pgwf.extend_lease(
+    p_tenant_id TEXT,
     p_job_id TEXT,
     p_lease_id TEXT,
     p_worker_id TEXT,
@@ -813,27 +899,32 @@ BEGIN
     SELECT *
     INTO v_job
     FROM pgwf._lock_job_for_status(
+        p_tenant_id,
         p_job_id,
         'ACTIVE',
         p_lease_id,
-        format('active lease not found for job %s', p_job_id)
+        format('active lease not found for job %s/%s', p_tenant_id, p_job_id)
     );
 
     IF v_job.cancel_requested THEN
-        RAISE EXCEPTION 'job %s is cancelled and cannot extend the lease', p_job_id;
+        RAISE EXCEPTION 'job %s/%s is cancelled and cannot extend the lease', p_tenant_id, p_job_id;
     END IF;
 
     v_new := clock_timestamp() + make_interval(secs => p_additional_seconds);
 
     UPDATE pgwf.jobs
     SET lease_expires_at = v_new
-    WHERE job_id = v_job.job_id AND lease_id = v_job.lease_id;
+    WHERE tenant_id = v_job.tenant_id
+      AND job_id = v_job.job_id
+      AND lease_id = v_job.lease_id;
 
     PERFORM pgwf._emit_trace_event(
+        p_tenant_id,
         p_job_id,
         'lease_extended',
         p_worker_id,
         jsonb_build_object(
+            'tenant_id', p_tenant_id,
             'job_id', p_job_id,
             'lease_id', p_lease_id,
             'additional_seconds', p_additional_seconds
@@ -849,6 +940,7 @@ END;
 $$;
 
 CREATE OR REPLACE FUNCTION pgwf.reschedule_job(
+    p_tenant_id TEXT,
     p_job_id TEXT,
     p_lease_id TEXT,
     p_worker_id TEXT,
@@ -865,14 +957,15 @@ DECLARE
 BEGIN
     SELECT * INTO v_job
     FROM pgwf._lock_job_for_status(
+        p_tenant_id,
         p_job_id,
         'ACTIVE',
         p_lease_id,
-        format('job %s is not currently leased with lease %s', p_job_id, p_lease_id)
+        format('job %s/%s is not currently leased with lease %s', p_tenant_id, p_job_id, p_lease_id)
     );
 
     IF v_job.cancel_requested THEN
-        RAISE EXCEPTION 'job %s is cancelled and cannot be rescheduled', p_job_id;
+        RAISE EXCEPTION 'job %s/%s is cancelled and cannot be rescheduled', p_tenant_id, p_job_id;
     END IF;
 
     RETURN QUERY
@@ -890,6 +983,7 @@ END;
 $$;
 
 CREATE OR REPLACE FUNCTION pgwf.complete_job(
+    p_tenant_id TEXT,
     p_job_id TEXT,
     p_lease_id TEXT,
     p_worker_id TEXT
@@ -901,10 +995,11 @@ DECLARE
     v_job pgwf.jobs_with_status%ROWTYPE;
 BEGIN
     v_job := pgwf._lock_job_for_status(
+        p_tenant_id,
         p_job_id,
         'ACTIVE',
         p_lease_id,
-        format('job %s is not actively leased by %s', p_job_id, p_lease_id)
+        format('job %s/%s is not actively leased by %s', p_tenant_id, p_job_id, p_lease_id)
     );
 
     RETURN pgwf._complete_locked_job(
@@ -916,6 +1011,7 @@ END;
 $$;
 
 CREATE OR REPLACE FUNCTION pgwf.complete_unheld_job(
+    p_tenant_id TEXT,
     p_job_id TEXT,
     p_worker_id TEXT
 )
@@ -928,10 +1024,11 @@ BEGIN
     SELECT *
     INTO v_job
     FROM pgwf._lock_job_for_status(
+        p_tenant_id,
         p_job_id,
         'READY',
         NULL,
-        format('job %s is not available to complete', p_job_id)
+        format('job %s/%s is not available to complete', p_tenant_id, p_job_id)
     );
 
     RETURN pgwf._complete_locked_job(
@@ -943,6 +1040,7 @@ END;
 $$;
 
 CREATE OR REPLACE FUNCTION pgwf.clear_crash_concern(
+    p_tenant_id TEXT,
     p_job_id TEXT,
     p_worker_id TEXT,
     p_reason TEXT DEFAULT NULL
@@ -954,6 +1052,9 @@ DECLARE
     v_job pgwf.jobs%ROWTYPE;
     v_previous_consecutive BIGINT;
 BEGIN
+    IF p_tenant_id IS NULL THEN
+        RAISE EXCEPTION 'tenant_id cannot be NULL';
+    END IF;
     IF p_job_id IS NULL THEN
         RAISE EXCEPTION 'job_id cannot be NULL';
     END IF;
@@ -964,31 +1065,35 @@ BEGIN
     SELECT *
     INTO v_job
     FROM pgwf.jobs
-    WHERE job_id = p_job_id
+    WHERE tenant_id = p_tenant_id
+      AND job_id = p_job_id
     FOR UPDATE;
 
     IF NOT FOUND THEN
-        IF EXISTS (SELECT 1 FROM pgwf.jobs_archive WHERE job_id = p_job_id) THEN
-            RAISE EXCEPTION 'job_id % has already been archived and cannot clear crash concern', p_job_id;
+        IF EXISTS (SELECT 1 FROM pgwf.jobs_archive WHERE tenant_id = p_tenant_id AND job_id = p_job_id) THEN
+            RAISE EXCEPTION 'job_id %/% has already been archived and cannot clear crash concern', p_tenant_id, p_job_id;
         END IF;
-        RAISE EXCEPTION 'job_id % does not exist', p_job_id;
+        RAISE EXCEPTION 'job_id %/% does not exist', p_tenant_id, p_job_id;
     END IF;
 
     IF v_job.cancel_requested THEN
-        RAISE EXCEPTION 'job % is cancelled and cannot clear crash concern', p_job_id;
+        RAISE EXCEPTION 'job %/%  is cancelled and cannot clear crash concern', p_tenant_id, p_job_id;
     END IF;
 
     v_previous_consecutive := v_job.consecutive_expirations;
 
     UPDATE pgwf.jobs
     SET consecutive_expirations = 0
-    WHERE job_id = v_job.job_id;
+    WHERE tenant_id = v_job.tenant_id
+      AND job_id = v_job.job_id;
 
     PERFORM pgwf._emit_trace_event(
+        p_tenant_id,
         p_job_id,
         'crash_concern_cleared',
         p_worker_id,
         jsonb_build_object(
+            'tenant_id', p_tenant_id,
             'job_id', p_job_id,
             'worker_id', p_worker_id,
             'previous_consecutive_expirations', v_previous_consecutive,
@@ -1003,16 +1108,18 @@ $$;
 
 CREATE OR REPLACE FUNCTION pgwf.archive_cancelled_jobs(
     p_worker_id TEXT,
+    p_tenant_ids TEXT[] DEFAULT NULL,
     p_limit INTEGER DEFAULT 100
 )
 RETURNS INTEGER
 LANGUAGE plpgsql
 AS $$
 DECLARE
-    v_job_ids TEXT[];
     v_archived_count INTEGER := 0;
     v_trace_enabled BOOLEAN := pgwf.is_trace_enabled();
     v_effective_limit INTEGER := COALESCE(p_limit, 0);
+    v_tenant_id TEXT;
+    v_job_ids TEXT[];
 BEGIN
     IF p_worker_id IS NULL THEN
         RAISE EXCEPTION 'worker_id cannot be NULL';
@@ -1022,24 +1129,18 @@ BEGIN
     END IF;
 
     WITH candidates AS (
-        SELECT job_id
+        SELECT tenant_id, job_id
         FROM pgwf.jobs
         WHERE cancel_requested
           AND lease_expires_at <= clock_timestamp()
+          AND (p_tenant_ids IS NULL OR array_length(p_tenant_ids, 1) IS NULL OR tenant_id = ANY(p_tenant_ids))
         ORDER BY created_at
         LIMIT v_effective_limit
         FOR UPDATE SKIP LOCKED
-    )
-    SELECT array_agg(job_id ORDER BY job_id)
-    INTO v_job_ids
-    FROM candidates;
-
-    IF v_job_ids IS NULL OR array_length(v_job_ids, 1) = 0 THEN
-        RETURN 0;
-    END IF;
-
-    WITH archived AS (
+    ),
+    archived AS (
         INSERT INTO pgwf.jobs_archive (
+            tenant_id,
             job_id,
             next_need,
             wait_for,
@@ -1055,6 +1156,7 @@ BEGIN
             cancel_requested_at
         )
         SELECT
+            j.tenant_id,
             j.job_id,
             j.next_need,
             j.wait_for,
@@ -1069,49 +1171,77 @@ BEGIN
             j.cancel_requested_by,
             j.cancel_requested_at
         FROM pgwf.jobs j
-        WHERE j.job_id = ANY(v_job_ids)
+        INNER JOIN candidates c ON j.tenant_id = c.tenant_id AND j.job_id = c.job_id
         RETURNING *
     ),
     deleted AS (
         DELETE FROM pgwf.jobs j
         USING archived a
-        WHERE j.job_id = a.job_id
-        RETURNING j.job_id
+        WHERE j.tenant_id = a.tenant_id
+          AND j.job_id = a.job_id
+        RETURNING j.tenant_id, j.job_id
     ),
     per_job_trace AS (
-        INSERT INTO pgwf.jobs_trace (job_id, event_type, worker_id, input_data, output_data)
+        INSERT INTO pgwf.jobs_trace (tenant_id, job_id, event_type, worker_id, input_data, output_data)
         SELECT
+            a.tenant_id,
             a.job_id,
             'job_cancel_archived',
             p_worker_id,
             jsonb_build_object(
+                'tenant_id', a.tenant_id,
                 'job_id', a.job_id,
-            'worker_id', p_worker_id,
-            'cancel_requested_at', a.cancel_requested_at
+                'worker_id', p_worker_id,
+                'cancel_requested_at', a.cancel_requested_at
             ),
             jsonb_build_object('archived_row', to_jsonb(a) - 'payload')
         FROM archived a
         WHERE v_trace_enabled
+    ),
+    tenant_groups AS (
+        SELECT d.tenant_id, array_agg(d.job_id) AS job_ids
+        FROM deleted d
+        GROUP BY d.tenant_id
     )
-    SELECT
-        COALESCE(COUNT(*), 0),
-        COALESCE(array_agg(job_id), ARRAY[]::TEXT[])
-    INTO v_archived_count, v_job_ids
+    SELECT COUNT(*)
+    INTO v_archived_count
     FROM deleted;
 
     IF v_archived_count = 0 THEN
         RETURN 0;
     END IF;
 
-    PERFORM pgwf._update_waiters_for_completion_bulk(v_job_ids);
+    -- Process each tenant's completed jobs to update waiters
+    -- Use a recursive approach: iterate through recently archived cancelled jobs
+    FOR v_tenant_id, v_job_ids IN
+        WITH recent_archived AS (
+            SELECT tenant_id, job_id
+            FROM pgwf.jobs_archive
+            WHERE cancel_requested
+              AND NOT EXISTS (
+                  SELECT 1 FROM pgwf.jobs j
+                  WHERE j.tenant_id = jobs_archive.tenant_id
+                    AND j.job_id = jobs_archive.job_id
+              )
+            ORDER BY created_at DESC
+            LIMIT v_effective_limit
+        )
+        SELECT tenant_id, array_agg(job_id) AS job_ids
+        FROM recent_archived
+        GROUP BY tenant_id
+    LOOP
+        PERFORM pgwf._update_waiters_for_completion_bulk(v_tenant_id, v_job_ids);
+    END LOOP;
 
     IF v_trace_enabled THEN
         PERFORM pgwf._emit_trace_event(
-            'pgwf.archive_cancelled_jobs',
+            'pgwf',
+            'archive_cancelled_jobs',
             'job_cancel_archived_run',
             p_worker_id,
             jsonb_build_object(
                 'worker_id', p_worker_id,
+                'tenant_ids', p_tenant_ids,
                 'limit', v_effective_limit,
                 'archived_jobs', v_archived_count
             )
@@ -1123,6 +1253,7 @@ END;
 $$;
 
 CREATE OR REPLACE FUNCTION pgwf.reschedule_unheld_job(
+    p_tenant_id TEXT,
     p_job_id TEXT,
     p_worker_id TEXT,
     p_next_need TEXT,
@@ -1139,14 +1270,15 @@ BEGIN
     SELECT *
     INTO v_job
     FROM pgwf._lock_job_for_status(
+        p_tenant_id,
         p_job_id,
         'READY',
         NULL,
-        format('job %s is not available to reschedule', p_job_id)
+        format('job %s/%s is not available to reschedule', p_tenant_id, p_job_id)
     );
 
     IF v_job.cancel_requested THEN
-        RAISE EXCEPTION 'job %s is cancelled and cannot be rescheduled', p_job_id;
+        RAISE EXCEPTION 'job %s/%s is cancelled and cannot be rescheduled', p_tenant_id, p_job_id;
     END IF;
 
     RETURN QUERY

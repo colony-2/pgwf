@@ -23,6 +23,10 @@ var (
 	testConnStr string
 )
 
+const (
+	defaultTenantID = "test-tenant"
+)
+
 func TestMain(m *testing.M) {
 	baseDir, err := os.MkdirTemp("", "pgwf-embed-")
 	if err != nil {
@@ -124,8 +128,8 @@ func TestSubmitAndLeaseFlow(t *testing.T) {
 	)
 
 	err := testDB.QueryRow(
-		`SELECT job_id, next_need, available_at FROM pgwf.submit_job($1, $2, $3)`,
-		"job-basic", "submitter", "cap.alpha",
+		`SELECT job_id, next_need, available_at FROM pgwf.submit_job($1, $2, $3, $4, $5)`,
+		defaultTenantID, "job-basic", "submitter", "cap.alpha", pqStringArray(nil),
 	).Scan(&jobID, &nextNeed, &available)
 	if err != nil {
 		t.Fatalf("submit_job failed: %v", err)
@@ -138,8 +142,8 @@ func TestSubmitAndLeaseFlow(t *testing.T) {
 	}
 
 	rows, err := testDB.Query(
-		`SELECT job_id, lease_id, lease_expires_at FROM pgwf.get_work($1, $2, $3, $4)`,
-		"worker-1", pqStringArray([]string{"cap.alpha"}), 30, 1,
+		`SELECT tenant_id, job_id, lease_id, lease_expires_at FROM pgwf.get_work($1, $2, $3, $4, $5)`,
+		"worker-1", pqStringArray([]string{"cap.alpha"}), nil, 30, 1,
 	)
 	if err != nil {
 		t.Fatalf("get_work failed: %v", err)
@@ -150,9 +154,9 @@ func TestSubmitAndLeaseFlow(t *testing.T) {
 		t.Fatalf("expected a leased job")
 	}
 
-	var leasedID, leaseID string
+	var tenantID, leasedID, leaseID string
 	var leaseExpires time.Time
-	if err := rows.Scan(&leasedID, &leaseID, &leaseExpires); err != nil {
+	if err := rows.Scan(&tenantID, &leasedID, &leaseID, &leaseExpires); err != nil {
 		t.Fatalf("scan leased row: %v", err)
 	}
 	if leasedID != jobID {
@@ -188,16 +192,16 @@ func TestPayloadLifecycle(t *testing.T) {
 	payload := `{"foo":"bar","n":2}`
 
 	if _, err := testDB.Exec(
-		`SELECT pgwf.submit_job($1, $2, $3, $4, $5)`,
-		"job-payload", "submitter", "cap.payload", pqStringArray([]string{}), payload,
+		`SELECT pgwf.submit_job($1, $2, $3, $4, $5, $6)`,
+		defaultTenantID, "job-payload", "submitter", "cap.payload", pqStringArray([]string{}), payload,
 	); err != nil {
 		t.Fatalf("submit_job with payload: %v", err)
 	}
 
 	var storedOK bool
 	if err := testDB.QueryRow(
-		`SELECT payload = $2::jsonb FROM pgwf.jobs WHERE job_id = $1`,
-		"job-payload", payload,
+		`SELECT payload = $3::jsonb FROM pgwf.jobs WHERE tenant_id = $1 AND job_id = $2`,
+		defaultTenantID, "job-payload", payload,
 	).Scan(&storedOK); err != nil {
 		t.Fatalf("verify stored payload: %v", err)
 	}
@@ -205,12 +209,12 @@ func TestPayloadLifecycle(t *testing.T) {
 		t.Fatalf("stored payload does not match expected value")
 	}
 
-	var jobID, leaseID string
+	var tenantID, jobID, leaseID string
 	var leasedOK bool
 	if err := testDB.QueryRow(
-		`SELECT job_id, lease_id, payload = $5::jsonb FROM pgwf.get_work($1, $2, $3, $4)`,
-		"worker-1", pqStringArray([]string{"cap.payload"}), 30, 1, payload,
-	).Scan(&jobID, &leaseID, &leasedOK); err != nil {
+		`SELECT tenant_id, job_id, lease_id, payload = $6::jsonb FROM pgwf.get_work($1, $2, $3, $4, $5)`,
+		"worker-1", pqStringArray([]string{"cap.payload"}), nil, 30, 1, payload,
+	).Scan(&tenantID, &jobID, &leaseID, &leasedOK); err != nil {
 		t.Fatalf("get_work: %v", err)
 	}
 	if jobID != "job-payload" {
@@ -220,14 +224,14 @@ func TestPayloadLifecycle(t *testing.T) {
 		t.Fatalf("leased payload does not match expected value")
 	}
 
-	if _, err := testDB.Exec(`SELECT pgwf.complete_job($1, $2, $3)`, jobID, leaseID, "worker-1"); err != nil {
+	if _, err := testDB.Exec(`SELECT pgwf.complete_job($1, $2, $3, $4)`, defaultTenantID, jobID, leaseID, "worker-1"); err != nil {
 		t.Fatalf("complete_job: %v", err)
 	}
 
 	var archivedOK bool
 	if err := testDB.QueryRow(
-		`SELECT payload = $2::jsonb FROM pgwf.jobs_archive WHERE job_id = $1`,
-		jobID, payload,
+		`SELECT payload = $3::jsonb FROM pgwf.jobs_archive WHERE tenant_id = $1 AND job_id = $2`,
+		defaultTenantID, jobID, payload,
 	).Scan(&archivedOK); err != nil {
 		t.Fatalf("verify archived payload: %v", err)
 	}
@@ -237,8 +241,8 @@ func TestPayloadLifecycle(t *testing.T) {
 
 	var payloadKeys int
 	if err := testDB.QueryRow(
-		`SELECT count(*) FROM pgwf.jobs_trace WHERE job_id = $1 AND (COALESCE(input_data ? 'payload', FALSE) OR COALESCE(output_data ? 'payload', FALSE))`,
-		jobID,
+		`SELECT count(*) FROM pgwf.jobs_trace WHERE tenant_id = $1 AND job_id = $2 AND (COALESCE(input_data ? 'payload', FALSE) OR COALESCE(output_data ? 'payload', FALSE))`,
+		defaultTenantID, jobID,
 	).Scan(&payloadKeys); err != nil {
 		t.Fatalf("trace payload check: %v", err)
 	}
@@ -253,8 +257,8 @@ func TestPayloadValidation(t *testing.T) {
 	t.Run("non-object payload", func(t *testing.T) {
 		var jobID string
 		err := testDB.QueryRow(
-			`SELECT job_id FROM pgwf.submit_job($1, $2, $3, $4, $5)`,
-			"job-non-object", "submitter", "cap.payload", pqStringArray(nil), `["not","object"]`,
+			`SELECT job_id FROM pgwf.submit_job($1, $2, $3, $4, $5, $6)`,
+			defaultTenantID, "job-non-object", "submitter", "cap.payload", pqStringArray(nil), `["not","object"]`,
 		).Scan(&jobID)
 		expectErrorContains(t, err, "payload must be a JSON object")
 	})
@@ -263,40 +267,40 @@ func TestPayloadValidation(t *testing.T) {
 		bigPayload := fmt.Sprintf(`{"data":"%s"}`, strings.Repeat("a", 520))
 		var jobID string
 		err := testDB.QueryRow(
-			`SELECT job_id FROM pgwf.submit_job($1, $2, $3, $4, $5)`,
-			"job-big", "submitter", "cap.payload", pqStringArray(nil), bigPayload,
+			`SELECT job_id FROM pgwf.submit_job($1, $2, $3, $4, $5, $6)`,
+			defaultTenantID, "job-big", "submitter", "cap.payload", pqStringArray(nil), bigPayload,
 		).Scan(&jobID)
 		expectErrorContains(t, err, "payload exceeds 512 bytes")
 	})
 
 	t.Run("reschedule rejects non-object payload", func(t *testing.T) {
 		_, err := testDB.Exec(
-			`SELECT pgwf.submit_job($1, $2, $3, $4, $5)`,
-			"job-resched-invalid", "submitter", "cap.payload", pqStringArray(nil), `{"ok":true}`,
+			`SELECT pgwf.submit_job($1, $2, $3, $4, $5, $6)`,
+			defaultTenantID, "job-resched-invalid", "submitter", "cap.payload", pqStringArray(nil), `{"ok":true}`,
 		)
 		if err != nil {
 			t.Fatalf("submit_job: %v", err)
 		}
 
-		var jobID, leaseID string
+		var tenantID, jobID, leaseID string
 		if err := testDB.QueryRow(
-			`SELECT job_id, lease_id FROM pgwf.get_work($1, $2, $3, $4)`,
-			"worker-lease", pqStringArray([]string{"cap.payload"}), 30, 1,
-		).Scan(&jobID, &leaseID); err != nil {
+			`SELECT tenant_id, job_id, lease_id FROM pgwf.get_work($1, $2, $3, $4, $5)`,
+		"worker-lease", pqStringArray([]string{"cap.payload"}), nil, 30, 1,
+		).Scan(&tenantID, &jobID, &leaseID); err != nil {
 			t.Fatalf("get_work: %v", err)
 		}
 
 		err = testDB.QueryRow(
-			`SELECT job_id FROM pgwf.reschedule_job($1, $2, $3, $4, $5, NULL::timestamptz, $6)`,
-			jobID, leaseID, "worker-lease", "cap.other", pqStringArray(nil), `["oops"]`,
+			`SELECT job_id FROM pgwf.reschedule_job($1, $2, $3, $4, $5, $6, NULL::timestamptz, $7)`,
+			defaultTenantID, jobID, leaseID, "worker-lease", "cap.other", pqStringArray(nil), `["oops"]`,
 		).Scan(&jobID)
 		expectErrorContains(t, err, "payload must be a JSON object")
 	})
 
 	t.Run("reschedule_unheld rejects oversized payload", func(t *testing.T) {
 		_, err := testDB.Exec(
-			`SELECT pgwf.submit_job($1, $2, $3, $4, $5)`,
-			"job-unheld-invalid", "submitter", "cap.payload", pqStringArray(nil), `{"ok":true}`,
+			`SELECT pgwf.submit_job($1, $2, $3, $4, $5, $6)`,
+			defaultTenantID, "job-unheld-invalid", "submitter", "cap.payload", pqStringArray(nil), `{"ok":true}`,
 		)
 		if err != nil {
 			t.Fatalf("submit_job: %v", err)
@@ -305,8 +309,8 @@ func TestPayloadValidation(t *testing.T) {
 		bigPayload := fmt.Sprintf(`{"data":"%s"}`, strings.Repeat("b", 520))
 		var rescheduled string
 		err = testDB.QueryRow(
-			`SELECT job_id FROM pgwf.reschedule_unheld_job($1, $2, $3, $4, NULL::timestamptz, $5)`,
-			"job-unheld-invalid", "operator", "cap.other", pqStringArray(nil), bigPayload,
+			`SELECT job_id FROM pgwf.reschedule_unheld_job($1, $2, $3, $4, $5, NULL::timestamptz, $6)`,
+			defaultTenantID, "job-unheld-invalid", "operator", "cap.other", pqStringArray(nil), bigPayload,
 		).Scan(&rescheduled)
 		expectErrorContains(t, err, "payload exceeds 512 bytes")
 	})
@@ -319,24 +323,24 @@ func TestPayloadRescheduleUpdates(t *testing.T) {
 	updated := `{"foo":"new"}`
 
 	if _, err := testDB.Exec(
-		`SELECT pgwf.submit_job($1, $2, $3, $4, $5)`,
-		"job-resched-payload", "submitter", "cap.payload.resched", pqStringArray(nil), initial,
+		`SELECT pgwf.submit_job($1, $2, $3, $4, $5, $6)`,
+		defaultTenantID, "job-resched-payload", "submitter", "cap.payload.resched", pqStringArray(nil), initial,
 	); err != nil {
 		t.Fatalf("submit_job: %v", err)
 	}
 
-	var jobID, leaseID string
+	var tenantID, jobID, leaseID string
 	if err := testDB.QueryRow(
-		`SELECT job_id, lease_id FROM pgwf.get_work($1, $2, $3, $4)`,
-		"worker-1", pqStringArray([]string{"cap.payload.resched"}), 30, 1,
-	).Scan(&jobID, &leaseID); err != nil {
+		`SELECT tenant_id, job_id, lease_id FROM pgwf.get_work($1, $2, $3, $4, $5)`,
+		"worker-1", pqStringArray([]string{"cap.payload.resched"}), nil, 30, 1,
+	).Scan(&tenantID, &jobID, &leaseID); err != nil {
 		t.Fatalf("get_work: %v", err)
 	}
 
 	var rescheduled string
 	if err := testDB.QueryRow(
-		`SELECT job_id FROM pgwf.reschedule_job($1, $2, $3, $4, $5, NULL::timestamptz, $6)`,
-		jobID, leaseID, "worker-1", "cap.payload.resched.next", pqStringArray(nil), updated,
+		`SELECT job_id FROM pgwf.reschedule_job($1, $2, $3, $4, $5, $6, NULL::timestamptz, $7)`,
+		defaultTenantID, jobID, leaseID, "worker-1", "cap.payload.resched.next", pqStringArray(nil), updated,
 	).Scan(&rescheduled); err != nil {
 		t.Fatalf("reschedule_job: %v", err)
 	}
@@ -347,8 +351,8 @@ func TestPayloadRescheduleUpdates(t *testing.T) {
 	var leasedJob, leasedLease string
 	var payloadOK bool
 	if err := testDB.QueryRow(
-		`SELECT job_id, lease_id, payload = $5::jsonb FROM pgwf.get_work($1, $2, $3, $4)`,
-		"worker-2", pqStringArray([]string{"cap.payload.resched.next"}), 30, 1, updated,
+		`SELECT job_id, lease_id, payload = $6::jsonb FROM pgwf.get_work($1, $2, $3, $4, $5)`,
+		"worker-2", pqStringArray([]string{"cap.payload.resched.next"}), nil, 30, 1, updated,
 	).Scan(&leasedJob, &leasedLease, &payloadOK); err != nil {
 		t.Fatalf("get_work after reschedule: %v", err)
 	}
@@ -359,7 +363,7 @@ func TestPayloadRescheduleUpdates(t *testing.T) {
 		t.Fatalf("expected updated payload from get_work")
 	}
 
-	if _, err := testDB.Exec(`SELECT pgwf.complete_job($1, $2, $3)`, leasedJob, leasedLease, "worker-2"); err != nil {
+	if _, err := testDB.Exec(`SELECT pgwf.complete_job($1, $2, $3, $4)`, defaultTenantID, leasedJob, leasedLease, "worker-2"); err != nil {
 		t.Fatalf("complete_job: %v", err)
 	}
 
@@ -376,8 +380,8 @@ func TestPayloadRescheduleUpdates(t *testing.T) {
 
 	var payloadKeys int
 	if err := testDB.QueryRow(
-		`SELECT count(*) FROM pgwf.jobs_trace WHERE job_id = $1 AND (COALESCE(input_data ? 'payload', FALSE) OR COALESCE(output_data ? 'payload', FALSE))`,
-		jobID,
+		`SELECT count(*) FROM pgwf.jobs_trace WHERE tenant_id = $1 AND job_id = $2 AND (COALESCE(input_data ? 'payload', FALSE) OR COALESCE(output_data ? 'payload', FALSE))`,
+		defaultTenantID, jobID,
 	).Scan(&payloadKeys); err != nil {
 		t.Fatalf("trace payload check: %v", err)
 	}
@@ -393,16 +397,16 @@ func TestPayloadUnheldRescheduleUpdates(t *testing.T) {
 	updated := `{"foo":"updated"}`
 
 	if _, err := testDB.Exec(
-		`SELECT pgwf.submit_job($1, $2, $3, $4, $5)`,
-		"job-unheld-payload", "submitter", "cap.payload.unheld", pqStringArray(nil), initial,
+		`SELECT pgwf.submit_job($1, $2, $3, $4, $5, $6)`,
+		defaultTenantID, "job-unheld-payload", "submitter", "cap.payload.unheld", pqStringArray(nil), initial,
 	); err != nil {
 		t.Fatalf("submit_job: %v", err)
 	}
 
 	var rescheduled string
 	if err := testDB.QueryRow(
-		`SELECT job_id FROM pgwf.reschedule_unheld_job($1, $2, $3, $4, NULL::timestamptz, $5)`,
-		"job-unheld-payload", "operator", "cap.payload.unheld.next", pqStringArray(nil), updated,
+		`SELECT job_id FROM pgwf.reschedule_unheld_job($1, $2, $3, $4, $5, NULL::timestamptz, $6)`,
+		defaultTenantID, "job-unheld-payload", "operator", "cap.payload.unheld.next", pqStringArray(nil), updated,
 	).Scan(&rescheduled); err != nil {
 		t.Fatalf("reschedule_unheld_job: %v", err)
 	}
@@ -410,12 +414,12 @@ func TestPayloadUnheldRescheduleUpdates(t *testing.T) {
 		t.Fatalf("expected job-unheld-payload, got %s", rescheduled)
 	}
 
-	var jobID, leaseID string
+	var tenantID, jobID, leaseID string
 	var payloadOK bool
 	if err := testDB.QueryRow(
-		`SELECT job_id, lease_id, payload = $5::jsonb FROM pgwf.get_work($1, $2, $3, $4)`,
-		"worker-3", pqStringArray([]string{"cap.payload.unheld.next"}), 30, 1, updated,
-	).Scan(&jobID, &leaseID, &payloadOK); err != nil {
+		`SELECT tenant_id, job_id, lease_id, payload = $6::jsonb FROM pgwf.get_work($1, $2, $3, $4, $5)`,
+		"worker-3", pqStringArray([]string{"cap.payload.unheld.next"}), nil, 30, 1, updated,
+	).Scan(&tenantID, &jobID, &leaseID, &payloadOK); err != nil {
 		t.Fatalf("get_work after unheld reschedule: %v", err)
 	}
 	if jobID != "job-unheld-payload" {
@@ -425,7 +429,7 @@ func TestPayloadUnheldRescheduleUpdates(t *testing.T) {
 		t.Fatalf("expected updated payload after unheld reschedule")
 	}
 
-	if _, err := testDB.Exec(`SELECT pgwf.complete_job($1, $2, $3)`, jobID, leaseID, "worker-3"); err != nil {
+	if _, err := testDB.Exec(`SELECT pgwf.complete_job($1, $2, $3, $4)`, defaultTenantID, jobID, leaseID, "worker-3"); err != nil {
 		t.Fatalf("complete_job: %v", err)
 	}
 
@@ -444,11 +448,11 @@ func TestPayloadUnheldRescheduleUpdates(t *testing.T) {
 func TestSingletonPreventsConcurrentLease(t *testing.T) {
 	resetTables(t)
 
-	_, err := testDB.Exec(`SELECT pgwf.submit_job($1, $2, $3, $4, $5, $6)`, "job-a", "submitter", "cap.beta", nil, nil, "single-key")
+	_, err := testDB.Exec(`SELECT pgwf.submit_job($1, $2, $3, $4, $5, $6, $7)`, defaultTenantID, "job-a", "submitter", "cap.beta", nil, nil, "single-key")
 	if err != nil {
 		t.Fatalf("submit job-a: %v", err)
 	}
-	_, err = testDB.Exec(`SELECT pgwf.submit_job($1, $2, $3, $4, $5, $6)`, "job-b", "submitter", "cap.beta", nil, nil, "single-key")
+	_, err = testDB.Exec(`SELECT pgwf.submit_job($1, $2, $3, $4, $5, $6, $7)`, defaultTenantID, "job-b", "submitter", "cap.beta", nil, nil, "single-key")
 	if err != nil {
 		t.Fatalf("submit job-b: %v", err)
 	}
@@ -458,11 +462,11 @@ func TestSingletonPreventsConcurrentLease(t *testing.T) {
 		t.Fatalf("expected job-a first, got %s", jobID)
 	}
 
-	if hasRow(t, `SELECT 1 FROM pgwf.get_work($1, $2, $3, $4)`, "worker", pqStringArray([]string{"cap.beta"}), 30, 1) {
+	if hasRow(t, `SELECT 1 FROM pgwf.get_work($1, $2, $3, $4, $5)`, "worker", pqStringArray([]string{"cap.beta"}), nil, 30, 1) {
 		t.Fatalf("second job should not lease while singleton active")
 	}
 
-	if _, err := testDB.Exec(`SELECT pgwf.complete_job($1, $2, $3)`, jobID, leaseID, "worker"); err != nil {
+	if _, err := testDB.Exec(`SELECT pgwf.complete_job($1, $2, $3, $4)`, defaultTenantID, jobID, leaseID, "worker"); err != nil {
 		t.Fatalf("complete_job failed: %v", err)
 	}
 
@@ -476,7 +480,7 @@ func TestSingletonImmutabilityOnReschedule(t *testing.T) {
 	t.Run("lease reschedule preserves key", func(t *testing.T) {
 		resetTables(t)
 
-		if _, err := testDB.Exec(`SELECT pgwf.submit_job($1, $2, $3, $4, $5, $6)`, "job-single-held", "submitter", "cap.single", nil, nil, "key-held"); err != nil {
+		if _, err := testDB.Exec(`SELECT pgwf.submit_job($1, $2, $3, $4, $5, $6, $7)`, defaultTenantID, "job-single-held", "submitter", "cap.single", nil, nil, "key-held"); err != nil {
 			t.Fatalf("submit job-single-held: %v", err)
 		}
 
@@ -484,8 +488,8 @@ func TestSingletonImmutabilityOnReschedule(t *testing.T) {
 
 		var rescheduled string
 		if err := testDB.QueryRow(
-			`SELECT job_id FROM pgwf.reschedule_job($1, $2, $3, $4)`,
-			jobID, leaseID, "worker", "cap.single.next",
+			`SELECT job_id FROM pgwf.reschedule_job($1, $2, $3, $4, $5, $6, $7, $8)`,
+		defaultTenantID, jobID, leaseID, "worker", "cap.single.next", pqStringArray(nil), nil, nil,
 		).Scan(&rescheduled); err != nil {
 			t.Fatalf("reschedule_job: %v", err)
 		}
@@ -494,7 +498,7 @@ func TestSingletonImmutabilityOnReschedule(t *testing.T) {
 		}
 
 		var singleton sql.NullString
-		if err := testDB.QueryRow(`SELECT singleton_key FROM pgwf.jobs WHERE job_id = $1`, jobID).Scan(&singleton); err != nil {
+		if err := testDB.QueryRow(`SELECT singleton_key FROM pgwf.jobs WHERE tenant_id = $1 AND job_id = $2`, defaultTenantID, jobID).Scan(&singleton); err != nil {
 			t.Fatalf("query jobs singleton_key: %v", err)
 		}
 		if !singleton.Valid || singleton.String != "key-held" {
@@ -512,11 +516,11 @@ func TestSingletonImmutabilityOnReschedule(t *testing.T) {
 	t.Run("unheld reschedule keeps null key", func(t *testing.T) {
 		resetTables(t)
 
-		if _, err := testDB.Exec(`SELECT pgwf.submit_job($1, $2, $3)`, "job-no-single", "submitter", "cap.no.single"); err != nil {
+		if _, err := testDB.Exec(`SELECT pgwf.submit_job($1, $2, $3, $4)`, defaultTenantID, "job-no-single", "submitter", "cap.no.single"); err != nil {
 			t.Fatalf("submit job-no-single: %v", err)
 		}
 
-		if _, err := testDB.Exec(`SELECT pgwf.reschedule_unheld_job($1, $2, $3)`, "job-no-single", "worker", "cap.no.single.next"); err != nil {
+		if _, err := testDB.Exec(`SELECT pgwf.reschedule_unheld_job($1, $2, $3, $4)`, defaultTenantID, "job-no-single", "worker", "cap.no.single.next"); err != nil {
 			t.Fatalf("reschedule_unheld_job: %v", err)
 		}
 
@@ -540,13 +544,13 @@ func TestSingletonImmutabilityOnReschedule(t *testing.T) {
 func TestDependencyRelease(t *testing.T) {
 	resetTables(t)
 
-	_, err := testDB.Exec(`SELECT pgwf.submit_job($1, $2, $3)`, "dep-parent", "submitter", "cap.parent")
+	_, err := testDB.Exec(`SELECT pgwf.submit_job($1, $2, $3, $4)`, defaultTenantID, "dep-parent", "submitter", "cap.parent")
 	if err != nil {
 		t.Fatalf("submit parent: %v", err)
 	}
 
 	waitDeps := pqStringArray([]string{"dep-parent"})
-	_, err = testDB.Exec(`SELECT pgwf.submit_job($1, $2, $3, $4)`, "dep-child", "submitter", "cap.child", waitDeps)
+	_, err = testDB.Exec(`SELECT pgwf.submit_job($1, $2, $3, $4, $5)`, defaultTenantID, "dep-child", "submitter", "cap.child", waitDeps)
 	if err != nil {
 		t.Fatalf("submit child: %v", err)
 	}
@@ -556,7 +560,7 @@ func TestDependencyRelease(t *testing.T) {
 		t.Fatalf("expected parent job first, got %s", jobID)
 	}
 
-	if _, err := testDB.Exec(`SELECT pgwf.complete_job($1, $2, $3)`, jobID, leaseID, "worker-parent"); err != nil {
+	if _, err := testDB.Exec(`SELECT pgwf.complete_job($1, $2, $3, $4)`, defaultTenantID, jobID, leaseID, "worker-parent"); err != nil {
 		t.Fatalf("complete parent: %v", err)
 	}
 
@@ -569,10 +573,10 @@ func TestDependencyRelease(t *testing.T) {
 func TestCancelJobPreventsFutureWork(t *testing.T) {
 	resetTables(t)
 
-	if _, err := testDB.Exec(`SELECT pgwf.submit_job($1, $2, $3)`, "job-cancel", "submitter", "cap.cancel"); err != nil {
+	if _, err := testDB.Exec(`SELECT pgwf.submit_job($1, $2, $3, $4)`, defaultTenantID, "job-cancel", "submitter", "cap.cancel"); err != nil {
 		t.Fatalf("submit job-cancel: %v", err)
 	}
-	if _, err := testDB.Exec(`SELECT pgwf.cancel_job($1, $2, $3)`, "job-cancel", "operator", "test"); err != nil {
+	if _, err := testDB.Exec(`SELECT pgwf.cancel_job($1, $2, $3, $4)`, defaultTenantID, "job-cancel", "operator", "test"); err != nil {
 		t.Fatalf("cancel job-cancel: %v", err)
 	}
 
@@ -586,7 +590,7 @@ func TestCancelJobPreventsFutureWork(t *testing.T) {
 
 	expectNoWork(t, []string{"cap.cancel"})
 
-	_, err := testDB.Exec(`SELECT pgwf.reschedule_unheld_job($1, $2, $3)`, "job-cancel", "operator", "cap.other")
+	_, err := testDB.Exec(`SELECT pgwf.reschedule_unheld_job($1, $2, $3, $4)`, defaultTenantID, "job-cancel", "operator", "cap.other")
 	if err == nil || (!strings.Contains(err.Error(), "cancelled") && !strings.Contains(err.Error(), "not available")) {
 		t.Fatalf("expected cancellation/availability error from reschedule_unheld_job, got %v", err)
 	}
@@ -595,7 +599,7 @@ func TestCancelJobPreventsFutureWork(t *testing.T) {
 func TestExtendLeaseAndReschedule(t *testing.T) {
 	resetTables(t)
 
-	_, err := testDB.Exec(`SELECT pgwf.submit_job($1, $2, $3)`, "job-resched", "submitter", "cap.gamma")
+	_, err := testDB.Exec(`SELECT pgwf.submit_job($1, $2, $3, $4)`, defaultTenantID, "job-resched", "submitter", "cap.gamma")
 	if err != nil {
 		t.Fatalf("submit job: %v", err)
 	}
@@ -608,7 +612,7 @@ func TestExtendLeaseAndReschedule(t *testing.T) {
 	}
 
 	var newExpire time.Time
-	if err := testDB.QueryRow(`SELECT pgwf.extend_lease($1, $2, $3, $4)`, jobID, leaseID, "worker", 120).Scan(&newExpire); err != nil {
+	if err := testDB.QueryRow(`SELECT pgwf.extend_lease($1, $2, $3, $4, $5)`, defaultTenantID, jobID, leaseID, "worker", 120).Scan(&newExpire); err != nil {
 		t.Fatalf("extend lease: %v", err)
 	}
 	if !newExpire.After(currentExpires) {
@@ -616,8 +620,8 @@ func TestExtendLeaseAndReschedule(t *testing.T) {
 	}
 
 	err = testDB.QueryRow(
-		`SELECT job_id FROM pgwf.reschedule_job($1, $2, $3, $4, $5, $6)`,
-		jobID, leaseID, "worker", "cap.delta", pqStringArray([]string{}), time.Now(),
+		`SELECT job_id FROM pgwf.reschedule_job($1, $2, $3, $4, $5, $6, $7, $8)`,
+		defaultTenantID, jobID, leaseID, "worker", "cap.delta", pqStringArray([]string{}), time.Now(), nil,
 	).Scan(&jobID)
 	if err != nil {
 		t.Fatalf("reschedule failed: %v", err)
@@ -632,13 +636,13 @@ func TestExtendLeaseAndReschedule(t *testing.T) {
 func TestCancelActiveJobBlocksExtensions(t *testing.T) {
 	resetTables(t)
 
-	if _, err := testDB.Exec(`SELECT pgwf.submit_job($1, $2, $3)`, "job-active-cancel", "submitter", "cap.cancel.active"); err != nil {
+	if _, err := testDB.Exec(`SELECT pgwf.submit_job($1, $2, $3, $4)`, defaultTenantID, "job-active-cancel", "submitter", "cap.cancel.active"); err != nil {
 		t.Fatalf("submit job: %v", err)
 	}
 
 	rows, err := testDB.Query(
-		`SELECT job_id, lease_id FROM pgwf.get_work($1, $2, $3, $4)`,
-		"worker-active", pqStringArray([]string{"cap.cancel.active"}), 30, 1,
+		`SELECT tenant_id, job_id, lease_id FROM pgwf.get_work($1, $2, $3, $4, $5)`,
+		"worker-active", pqStringArray([]string{"cap.cancel.active"}), nil, 30, 1,
 	)
 	if err != nil {
 		t.Fatalf("get_work job-active-cancel: %v", err)
@@ -647,24 +651,24 @@ func TestCancelActiveJobBlocksExtensions(t *testing.T) {
 	if !rows.Next() {
 		t.Fatalf("expected lease row")
 	}
-	var jobID, leaseID string
-	if err := rows.Scan(&jobID, &leaseID); err != nil {
+	var tenantID, jobID, leaseID string
+	if err := rows.Scan(&tenantID, &jobID, &leaseID); err != nil {
 		t.Fatalf("scan lease: %v", err)
 	}
 
-	if _, err := testDB.Exec(`SELECT pgwf.cancel_job($1, $2, $3)`, jobID, "operator-active", "active cancellation"); err != nil {
+	if _, err := testDB.Exec(`SELECT pgwf.cancel_job($1, $2, $3, $4)`, defaultTenantID, jobID, "operator-active", "active cancellation"); err != nil {
 		t.Fatalf("cancel active job: %v", err)
 	}
 
-	_, err = testDB.Exec(`SELECT pgwf.extend_lease($1, $2, $3, $4)`, jobID, leaseID, "worker-active", 30)
+	_, err = testDB.Exec(`SELECT pgwf.extend_lease($1, $2, $3, $4, $5)`, defaultTenantID, jobID, leaseID, "worker-active", 30)
 	if err == nil || !strings.Contains(err.Error(), "cancelled") {
 		t.Fatalf("expected extend_lease cancellation error, got %v", err)
 	}
 
 	var dummy string
 	err = testDB.QueryRow(
-		`SELECT job_id FROM pgwf.reschedule_job($1, $2, $3, $4)`,
-		jobID, leaseID, "worker-active", "cap.cancel.active",
+		`SELECT job_id FROM pgwf.reschedule_job($1, $2, $3, $4, $5, $6, $7, $8)`,
+		defaultTenantID, jobID, leaseID, "worker-active", "cap.cancel.active", pqStringArray(nil), nil, nil,
 	).Scan(&dummy)
 	if err == nil || !strings.Contains(err.Error(), "cancelled") {
 		t.Fatalf("expected reschedule cancellation error, got %v", err)
@@ -676,7 +680,7 @@ func TestTraceToggle(t *testing.T) {
 	defer setTrace(t, true)
 
 	setTrace(t, false)
-	if _, err := testDB.Exec(`SELECT pgwf.submit_job($1, $2, $3)`, "trace-off", "submitter", "cap.trace"); err != nil {
+	if _, err := testDB.Exec(`SELECT pgwf.submit_job($1, $2, $3, $4)`, defaultTenantID, "trace-off", "submitter", "cap.trace"); err != nil {
 		t.Fatalf("submit with trace disabled: %v", err)
 	}
 	if count := traceCount(t); count != 0 {
@@ -685,7 +689,7 @@ func TestTraceToggle(t *testing.T) {
 
 	resetTables(t)
 	setTrace(t, true)
-	if _, err := testDB.Exec(`SELECT pgwf.submit_job($1, $2, $3)`, "trace-on", "submitter", "cap.trace"); err != nil {
+	if _, err := testDB.Exec(`SELECT pgwf.submit_job($1, $2, $3, $4)`, defaultTenantID, "trace-on", "submitter", "cap.trace"); err != nil {
 		t.Fatalf("submit with trace enabled: %v", err)
 	}
 	jobID, _ := leaseSingleJob(t, []string{"cap.trace"})
@@ -713,8 +717,8 @@ func TestGetWorkErrors(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			rows, err := testDB.Query(
-				`SELECT * FROM pgwf.get_work($1, $2, $3, $4)`,
-				"worker", pqStringArray(tc.caps), tc.leaseSeconds, tc.limitJobs,
+				`SELECT * FROM pgwf.get_work($1, $2, $3, $4, $5)`,
+		"worker", pqStringArray(tc.caps), nil, tc.leaseSeconds, tc.limitJobs,
 			)
 			if rows != nil {
 				rows.Close()
@@ -727,7 +731,7 @@ func TestGetWorkErrors(t *testing.T) {
 func TestLeaseValidationErrors(t *testing.T) {
 	resetTables(t)
 
-	if _, err := testDB.Exec(`SELECT pgwf.submit_job($1, $2, $3)`, "job-err", "submitter", "cap.err"); err != nil {
+	if _, err := testDB.Exec(`SELECT pgwf.submit_job($1, $2, $3, $4)`, defaultTenantID, "job-err", "submitter", "cap.err"); err != nil {
 		t.Fatalf("submit job: %v", err)
 	}
 
@@ -743,8 +747,8 @@ func TestLeaseValidationErrors(t *testing.T) {
 	t.Run("reschedule without lease", func(t *testing.T) {
 		var jobID string
 		err := testDB.QueryRow(
-			`SELECT job_id FROM pgwf.reschedule_job($1, $2, $3, $4, $5, $6)`,
-			"job-err", "missing", "worker", "cap.err", pqStringArray(nil), time.Now(),
+			`SELECT job_id FROM pgwf.reschedule_job($1, $2, $3, $4, $5, $6, $7, $8)`,
+			defaultTenantID, "job-err", "missing", "worker", "cap.err", pqStringArray(nil), time.Now(), nil,
 		).Scan(&jobID)
 		expectErrorContains(t, err, "is not currently leased")
 	})
@@ -752,8 +756,8 @@ func TestLeaseValidationErrors(t *testing.T) {
 	t.Run("complete without lease", func(t *testing.T) {
 		var ok bool
 		err := testDB.QueryRow(
-			`SELECT pgwf.complete_job($1, $2, $3)`,
-			"job-err", "missing", "worker",
+			`SELECT pgwf.complete_job($1, $2, $3, $4)`,
+			defaultTenantID, "job-err", "missing", "worker",
 		).Scan(&ok)
 		expectErrorContains(t, err, "is not actively leased")
 	})
@@ -762,10 +766,10 @@ func TestLeaseValidationErrors(t *testing.T) {
 func TestDuplicateJobSubmission(t *testing.T) {
 	resetTables(t)
 
-	if _, err := testDB.Exec(`SELECT pgwf.submit_job($1, $2, $3)`, "job-dup", "submitter", "cap.dup"); err != nil {
+	if _, err := testDB.Exec(`SELECT pgwf.submit_job($1, $2, $3, $4)`, defaultTenantID, "job-dup", "submitter", "cap.dup"); err != nil {
 		t.Fatalf("first submit: %v", err)
 	}
-	_, err := testDB.Exec(`SELECT pgwf.submit_job($1, $2, $3)`, "job-dup", "submitter", "cap.dup")
+	_, err := testDB.Exec(`SELECT pgwf.submit_job($1, $2, $3, $4)`, defaultTenantID, "job-dup", "submitter", "cap.dup")
 	if err == nil {
 		t.Fatal("expected duplicate submission to fail")
 	}
@@ -778,13 +782,13 @@ func TestDuplicateJobSubmission(t *testing.T) {
 func TestCompletionArchivesJob(t *testing.T) {
 	resetTables(t)
 
-	if _, err := testDB.Exec(`SELECT pgwf.submit_job($1, $2, $3)`, "job-archive", "submitter", "cap.archive"); err != nil {
+	if _, err := testDB.Exec(`SELECT pgwf.submit_job($1, $2, $3, $4)`, defaultTenantID, "job-archive", "submitter", "cap.archive"); err != nil {
 		t.Fatalf("submit: %v", err)
 	}
 	jobID, leaseID := leaseSingleJob(t, []string{"cap.archive"})
 
 	var ok bool
-	if err := testDB.QueryRow(`SELECT pgwf.complete_job($1, $2, $3)`, jobID, leaseID, "worker").Scan(&ok); err != nil {
+	if err := testDB.QueryRow(`SELECT pgwf.complete_job($1, $2, $3, $4)`, defaultTenantID, jobID, leaseID, "worker").Scan(&ok); err != nil {
 		t.Fatalf("complete_job: %v", err)
 	}
 	if !ok {
@@ -815,7 +819,7 @@ func TestCompletionArchivesJob(t *testing.T) {
 		t.Fatalf("expected job_finished trace, got %d", finishEvents)
 	}
 
-	_, err := testDB.Exec(`SELECT pgwf.submit_job($1, $2, $3)`, "job-archive", "submitter", "cap.archive")
+	_, err := testDB.Exec(`SELECT pgwf.submit_job($1, $2, $3, $4)`, defaultTenantID, "job-archive", "submitter", "cap.archive")
 	if err == nil {
 		t.Fatalf("expected resubmission of archived job to fail")
 	}
@@ -825,40 +829,40 @@ func TestCompletionArchivesJob(t *testing.T) {
 func TestArchiveCancelledJobs(t *testing.T) {
 	resetTables(t)
 
-	if _, err := testDB.Exec(`SELECT pgwf.submit_job($1, $2, $3)`, "cancel-1", "submitter", "cap.cancel.archive"); err != nil {
+	if _, err := testDB.Exec(`SELECT pgwf.submit_job($1, $2, $3, $4)`, defaultTenantID, "cancel-1", "submitter", "cap.cancel.archive"); err != nil {
 		t.Fatalf("submit cancel-1: %v", err)
 	}
 	waitDeps := pqStringArray([]string{"cancel-1"})
-	if _, err := testDB.Exec(`SELECT pgwf.submit_job($1, $2, $3, $4)`, "dependent", "submitter", "cap.dependent", waitDeps); err != nil {
+	if _, err := testDB.Exec(`SELECT pgwf.submit_job($1, $2, $3, $4, $5)`, defaultTenantID, "dependent", "submitter", "cap.dependent", waitDeps); err != nil {
 		t.Fatalf("submit dependent: %v", err)
 	}
-	if _, err := testDB.Exec(`SELECT pgwf.submit_job($1, $2, $3)`, "cancel-2", "submitter", "cap.cancel.other"); err != nil {
+	if _, err := testDB.Exec(`SELECT pgwf.submit_job($1, $2, $3, $4)`, defaultTenantID, "cancel-2", "submitter", "cap.cancel.other"); err != nil {
 		t.Fatalf("submit cancel-2: %v", err)
 	}
 
-	if _, err := testDB.Exec(`SELECT pgwf.cancel_job($1, $2, $3)`, "cancel-1", "operator", "archive test"); err != nil {
+	if _, err := testDB.Exec(`SELECT pgwf.cancel_job($1, $2, $3, $4)`, defaultTenantID, "cancel-1", "operator", "archive test"); err != nil {
 		t.Fatalf("cancel cancel-1: %v", err)
 	}
-	if _, err := testDB.Exec(`SELECT pgwf.cancel_job($1, $2, $3)`, "cancel-2", "operator", "archive test"); err != nil {
+	if _, err := testDB.Exec(`SELECT pgwf.cancel_job($1, $2, $3, $4)`, defaultTenantID, "cancel-2", "operator", "archive test"); err != nil {
 		t.Fatalf("cancel cancel-2: %v", err)
 	}
 
 	var archived int
-	if err := testDB.QueryRow(`SELECT pgwf.archive_cancelled_jobs($1, $2)`, "sweeper", 10).Scan(&archived); err != nil {
+	if err := testDB.QueryRow(`SELECT pgwf.archive_cancelled_jobs($1, $2, $3)`, "sweeper", nil, 10).Scan(&archived); err != nil {
 		t.Fatalf("archive_cancelled_jobs: %v", err)
 	}
 	if archived != 2 {
 		t.Fatalf("expected to archive 2 jobs, got %d", archived)
 	}
 
-	if hasRow(t, `SELECT 1 FROM pgwf.jobs WHERE job_id = ANY($1)`, pqStringArray([]string{"cancel-1", "cancel-2"})) {
+	if hasRow(t, `SELECT 1 FROM pgwf.jobs WHERE tenant_id = $1 AND job_id = ANY($2)`, defaultTenantID, pqStringArray([]string{"cancel-1", "cancel-2"})) {
 		t.Fatalf("cancelled jobs should be removed from live table")
 	}
 
 	var cancelledArchiveRows int
 	if err := testDB.QueryRow(
-		`SELECT count(*) FROM pgwf.jobs_archive WHERE job_id = ANY($1) AND cancel_requested`,
-		pqStringArray([]string{"cancel-1", "cancel-2"}),
+		`SELECT count(*) FROM pgwf.jobs_archive WHERE tenant_id = $1 AND job_id = ANY($2) AND cancel_requested`,
+		defaultTenantID, pqStringArray([]string{"cancel-1", "cancel-2"}),
 	).Scan(&cancelledArchiveRows); err != nil {
 		t.Fatalf("count archived rows: %v", err)
 	}
@@ -867,7 +871,7 @@ func TestArchiveCancelledJobs(t *testing.T) {
 	}
 
 	var depWait pqStringArray
-	if err := testDB.QueryRow(`SELECT wait_for FROM pgwf.jobs WHERE job_id = 'dependent'`).Scan(&depWait); err != nil {
+	if err := testDB.QueryRow(`SELECT wait_for FROM pgwf.jobs WHERE tenant_id = $1 AND job_id = $2`, defaultTenantID, "dependent").Scan(&depWait); err != nil {
 		t.Fatalf("query dependent wait_for: %v", err)
 	}
 	if len(depWait) != 0 {
@@ -890,7 +894,7 @@ func TestArchiveCancelledJobs(t *testing.T) {
 		t.Fatalf("expected single run trace after archiving, got %d", runTraceCountBefore)
 	}
 
-	if err := testDB.QueryRow(`SELECT pgwf.archive_cancelled_jobs($1, $2)`, "sweeper", 10).Scan(&archived); err != nil {
+	if err := testDB.QueryRow(`SELECT pgwf.archive_cancelled_jobs($1, $2, $3)`, "sweeper", nil, 10).Scan(&archived); err != nil {
 		t.Fatalf("second archive_cancelled_jobs: %v", err)
 	}
 	if archived != 0 {
@@ -918,7 +922,7 @@ func TestNotifyToggle(t *testing.T) {
 	setNotify(t, true)
 	drainNotifications(listener)
 
-	if _, err := testDB.Exec(`SELECT pgwf.submit_job($1, $2, $3)`, "job-notify-on", "submitter", "cap.notify"); err != nil {
+	if _, err := testDB.Exec(`SELECT pgwf.submit_job($1, $2, $3, $4)`, defaultTenantID, "job-notify-on", "submitter", "cap.notify"); err != nil {
 		t.Fatalf("submit job-notify-on: %v", err)
 	}
 	if !waitForNotification(listener, time.Second) {
@@ -929,7 +933,7 @@ func TestNotifyToggle(t *testing.T) {
 	setNotify(t, false)
 	drainNotifications(listener)
 
-	if _, err := testDB.Exec(`SELECT pgwf.submit_job($1, $2, $3)`, "job-notify-off", "submitter", "cap.notify"); err != nil {
+	if _, err := testDB.Exec(`SELECT pgwf.submit_job($1, $2, $3, $4)`, defaultTenantID, "job-notify-off", "submitter", "cap.notify"); err != nil {
 		t.Fatalf("submit job-notify-off: %v", err)
 	}
 	if waitForNotification(listener, 300*time.Millisecond) {
@@ -946,17 +950,17 @@ func TestCancelPendingJobSuppressesNotify(t *testing.T) {
 	defer listener.Close()
 	drainNotifications(listener)
 
-	if _, err := testDB.Exec(`SELECT pgwf.submit_job($1, $2, $3)`, "blocker-cancel", "submitter", "cap.blocker.cancel"); err != nil {
+	if _, err := testDB.Exec(`SELECT pgwf.submit_job($1, $2, $3, $4)`, defaultTenantID, "blocker-cancel", "submitter", "cap.blocker.cancel"); err != nil {
 		t.Fatalf("submit blocker: %v", err)
 	}
 	waitDeps := pqStringArray([]string{"blocker-cancel"})
 	if _, err := testDB.Exec(
-		`SELECT pgwf.submit_job($1, $2, $3, $4)`,
-		"pending-cancel", "submitter", "cap.pending.cancel", waitDeps,
+		`SELECT pgwf.submit_job($1, $2, $3, $4, $5)`,
+		defaultTenantID, "pending-cancel", "submitter", "cap.pending.cancel", waitDeps,
 	); err != nil {
 		t.Fatalf("submit pending job: %v", err)
 	}
-	if _, err := testDB.Exec(`SELECT pgwf.cancel_job($1, $2, $3)`, "pending-cancel", "operator", "cancel pending"); err != nil {
+	if _, err := testDB.Exec(`SELECT pgwf.cancel_job($1, $2, $3, $4)`, defaultTenantID, "pending-cancel", "operator", "cancel pending"); err != nil {
 		t.Fatalf("cancel pending job: %v", err)
 	}
 	drainNotifications(listener)
@@ -965,7 +969,7 @@ func TestCancelPendingJobSuppressesNotify(t *testing.T) {
 	if blockerJob != "blocker-cancel" {
 		t.Fatalf("expected blocker-cancel, got %s", blockerJob)
 	}
-	if _, err := testDB.Exec(`SELECT pgwf.complete_job($1, $2, $3)`, blockerJob, blockerLease, "worker-blocker"); err != nil {
+	if _, err := testDB.Exec(`SELECT pgwf.complete_job($1, $2, $3, $4)`, defaultTenantID, blockerJob, blockerLease, "worker-blocker"); err != nil {
 		t.Fatalf("complete blocker: %v", err)
 	}
 
@@ -994,8 +998,8 @@ func TestGetWorkRegistersListen(t *testing.T) {
 	caps := []string{"cap.listen.a", "cap.listen.b"}
 
 	rows, err := conn.QueryContext(ctx,
-		`SELECT * FROM pgwf.get_work($1, $2, $3, $4)`,
-		"worker-listen", pqStringArray(caps), 30, 1,
+		`SELECT * FROM pgwf.get_work($1, $2, $3, $4, $5)`,
+		"worker-listen", pqStringArray(caps), nil, 30, 1,
 	)
 	if err != nil {
 		t.Fatalf("get_work: %v", err)
@@ -1034,27 +1038,27 @@ func TestGetWorkRegistersListen(t *testing.T) {
 func TestJobsStatusViews(t *testing.T) {
 	resetTables(t)
 
-	if _, err := testDB.Exec(`SELECT pgwf.submit_job($1, $2, $3)`, "job-ready", "submitter", "cap.ready"); err != nil {
+	if _, err := testDB.Exec(`SELECT pgwf.submit_job($1, $2, $3, $4)`, defaultTenantID, "job-ready", "submitter", "cap.ready"); err != nil {
 		t.Fatalf("submit job-ready: %v", err)
 	}
 
-	if _, err := testDB.Exec(`SELECT pgwf.submit_job($1, $2, $3)`, "job-blocker", "submitter", "cap.blocker"); err != nil {
+	if _, err := testDB.Exec(`SELECT pgwf.submit_job($1, $2, $3, $4)`, defaultTenantID, "job-blocker", "submitter", "cap.blocker"); err != nil {
 		t.Fatalf("submit job-blocker: %v", err)
 	}
 	waitDeps := pqStringArray([]string{"job-blocker"})
-	if _, err := testDB.Exec(`SELECT pgwf.submit_job($1, $2, $3, $4)`, "job-pending", "submitter", "cap.pending", waitDeps); err != nil {
+	if _, err := testDB.Exec(`SELECT pgwf.submit_job($1, $2, $3, $4, $5)`, defaultTenantID, "job-pending", "submitter", "cap.pending", waitDeps); err != nil {
 		t.Fatalf("submit job-pending: %v", err)
 	}
 
 	futureTime := time.Now().UTC().Add(2 * time.Hour).Truncate(time.Microsecond)
 	if _, err := testDB.Exec(
-		`SELECT pgwf.submit_job($1, $2, $3, $4, $5, $6, $7)`,
-		"job-future", "submitter", "cap.future", pqStringArray([]string{}), nil, nil, futureTime,
+		`SELECT pgwf.submit_job($1, $2, $3, $4, $5, $6, $7, $8)`,
+		defaultTenantID, "job-future", "submitter", "cap.future", pqStringArray([]string{}), nil, nil, futureTime,
 	); err != nil {
 		t.Fatalf("submit job-future: %v", err)
 	}
 
-	if _, err := testDB.Exec(`SELECT pgwf.submit_job($1, $2, $3)`, "job-active", "submitter", "cap.active"); err != nil {
+	if _, err := testDB.Exec(`SELECT pgwf.submit_job($1, $2, $3, $4)`, defaultTenantID, "job-active", "submitter", "cap.active"); err != nil {
 		t.Fatalf("submit job-active: %v", err)
 	}
 	activeJob, activeLease := leaseSingleJob(t, []string{"cap.active"})
@@ -1062,23 +1066,23 @@ func TestJobsStatusViews(t *testing.T) {
 		t.Fatalf("expected job-active lease, got %s", activeJob)
 	}
 
-	if _, err := testDB.Exec(`SELECT pgwf.submit_job($1, $2, $3)`, "job-cancelled", "submitter", "cap.cancelled"); err != nil {
+	if _, err := testDB.Exec(`SELECT pgwf.submit_job($1, $2, $3, $4)`, defaultTenantID, "job-cancelled", "submitter", "cap.cancelled"); err != nil {
 		t.Fatalf("submit job-cancelled: %v", err)
 	}
-	if _, err := testDB.Exec(`SELECT pgwf.cancel_job($1, $2, $3)`, "job-cancelled", "operator", "view test"); err != nil {
+	if _, err := testDB.Exec(`SELECT pgwf.cancel_job($1, $2, $3, $4)`, defaultTenantID, "job-cancelled", "operator", "view test"); err != nil {
 		t.Fatalf("cancel job-cancelled: %v", err)
 	}
 
 	expiredAt := time.Now().UTC().Add(-time.Hour).Truncate(time.Microsecond)
 	if _, err := testDB.Exec(
-		`SELECT pgwf.submit_job($1, $2, $3, $4, $5, $6, $7, $8)`,
-		"job-expired", "submitter", "cap.expired", pqStringArray([]string{}), nil, nil, nil, expiredAt,
+		`SELECT pgwf.submit_job($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+		defaultTenantID, "job-expired", "submitter", "cap.expired", pqStringArray([]string{}), nil, nil, nil, expiredAt,
 	); err != nil {
 		t.Fatalf("submit job-expired: %v", err)
 	}
 
 	targetIDs := []string{"job-active", "job-future", "job-pending", "job-ready", "job-cancelled", "job-expired"}
-	rows, err := testDB.Query(`SELECT job_id, status FROM pgwf.jobs_with_status WHERE job_id = ANY($1)`, pqStringArray(targetIDs))
+	rows, err := testDB.Query(`SELECT job_id, status FROM pgwf.jobs_with_status WHERE tenant_id = $1 AND job_id = ANY($2)`, defaultTenantID, pqStringArray(targetIDs))
 	if err != nil {
 		t.Fatalf("query jobs_with_status: %v", err)
 	}
@@ -1218,8 +1222,8 @@ func TestExpiredJobsSkipLeasing(t *testing.T) {
 
 	expiredAt := time.Now().UTC().Add(-time.Hour).Truncate(time.Microsecond)
 	if _, err := testDB.Exec(
-		`SELECT pgwf.submit_job($1, $2, $3, $4, $5, $6, $7, $8)`,
-		"job-expired", "submitter", "cap.expired", pqStringArray([]string{}), nil, nil, nil, expiredAt,
+		`SELECT pgwf.submit_job($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+		defaultTenantID, "job-expired", "submitter", "cap.expired", pqStringArray([]string{}), nil, nil, nil, expiredAt,
 	); err != nil {
 		t.Fatalf("submit expired job: %v", err)
 	}
@@ -1227,7 +1231,7 @@ func TestExpiredJobsSkipLeasing(t *testing.T) {
 	expectNoWork(t, []string{"cap.expired"})
 
 	var status string
-	if err := testDB.QueryRow(`SELECT status FROM pgwf.jobs_with_status WHERE job_id = $1`, "job-expired").Scan(&status); err != nil {
+	if err := testDB.QueryRow(`SELECT status FROM pgwf.jobs_with_status WHERE tenant_id = $1 AND job_id = $2`, defaultTenantID, "job-expired").Scan(&status); err != nil {
 		t.Fatalf("query status: %v", err)
 	}
 	if status != "EXPIRED" {
@@ -1236,8 +1240,8 @@ func TestExpiredJobsSkipLeasing(t *testing.T) {
 
 	var rescheduled string
 	err := testDB.QueryRow(
-		`SELECT job_id FROM pgwf.reschedule_unheld_job($1, $2, $3, $4, $5)`,
-		"job-expired", "operator", "cap.expired.new", pqStringArray([]string{}), time.Now().UTC(),
+		`SELECT job_id FROM pgwf.reschedule_unheld_job($1, $2, $3, $4, $5, $6, $7)`,
+		defaultTenantID, "job-expired", "operator", "cap.expired.new", pqStringArray([]string{}), time.Now().UTC(), nil,
 	).Scan(&rescheduled)
 	if err != nil {
 		t.Fatalf("reschedule expired job: %v", err)
@@ -1246,7 +1250,7 @@ func TestExpiredJobsSkipLeasing(t *testing.T) {
 		t.Fatalf("expected job-expired reschedule, got %s", rescheduled)
 	}
 
-	if err := testDB.QueryRow(`SELECT status FROM pgwf.jobs_with_status WHERE job_id = $1`, "job-expired").Scan(&status); err != nil {
+	if err := testDB.QueryRow(`SELECT status FROM pgwf.jobs_with_status WHERE tenant_id = $1 AND job_id = $2`, defaultTenantID, "job-expired").Scan(&status); err != nil {
 		t.Fatalf("query status after reschedule: %v", err)
 	}
 	if status != "EXPIRED" {
@@ -1261,20 +1265,20 @@ func TestExtendLeaseOnExpiredJob(t *testing.T) {
 
 	expiresSoon := time.Now().UTC().Add(time.Minute).Truncate(time.Microsecond)
 	if _, err := testDB.Exec(
-		`SELECT pgwf.submit_job($1, $2, $3, $4, $5, $6, $7, $8)`,
-		"job-extend", "submitter", "cap.extend", pqStringArray([]string{}), nil, nil, nil, expiresSoon,
+		`SELECT pgwf.submit_job($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+		defaultTenantID, "job-extend", "submitter", "cap.extend", pqStringArray([]string{}), nil, nil, nil, expiresSoon,
 	); err != nil {
 		t.Fatalf("submit job: %v", err)
 	}
 
 	jobID, leaseID := leaseSingleJob(t, []string{"cap.extend"})
 
-	if _, err := testDB.Exec(`UPDATE pgwf.jobs SET expires_at = clock_timestamp() - interval '1 minute' WHERE job_id = $1`, jobID); err != nil {
+	if _, err := testDB.Exec(`UPDATE pgwf.jobs SET expires_at = clock_timestamp() - interval '1 minute' WHERE tenant_id = $1 AND job_id = $2`, defaultTenantID, jobID); err != nil {
 		t.Fatalf("force expiry: %v", err)
 	}
 
 	var newLeaseExpiry time.Time
-	if err := testDB.QueryRow(`SELECT pgwf.extend_lease($1, $2, $3, $4)`, jobID, leaseID, "worker-extend", 120).Scan(&newLeaseExpiry); err != nil {
+	if err := testDB.QueryRow(`SELECT pgwf.extend_lease($1, $2, $3, $4, $5)`, defaultTenantID, jobID, leaseID, "worker-extend", 120).Scan(&newLeaseExpiry); err != nil {
 		t.Fatalf("extend lease on expired job: %v", err)
 	}
 	if !newLeaseExpiry.After(time.Now().Add(time.Minute)) {
@@ -1293,14 +1297,14 @@ func TestExtendLeaseOnExpiredJob(t *testing.T) {
 func TestPartialDependencyRelease(t *testing.T) {
 	resetTables(t)
 
-	if _, err := testDB.Exec(`SELECT pgwf.submit_job($1, $2, $3)`, "dep-a", "submitter", "cap.parent"); err != nil {
+	if _, err := testDB.Exec(`SELECT pgwf.submit_job($1, $2, $3, $4)`, defaultTenantID, "dep-a", "submitter", "cap.parent"); err != nil {
 		t.Fatalf("submit dep-a: %v", err)
 	}
-	if _, err := testDB.Exec(`SELECT pgwf.submit_job($1, $2, $3)`, "dep-b", "submitter", "cap.parent"); err != nil {
+	if _, err := testDB.Exec(`SELECT pgwf.submit_job($1, $2, $3, $4)`, defaultTenantID, "dep-b", "submitter", "cap.parent"); err != nil {
 		t.Fatalf("submit dep-b: %v", err)
 	}
 	waitDeps := pqStringArray([]string{"dep-a", "dep-b"})
-	if _, err := testDB.Exec(`SELECT pgwf.submit_job($1, $2, $3, $4)`, "child", "submitter", "cap.child", waitDeps); err != nil {
+	if _, err := testDB.Exec(`SELECT pgwf.submit_job($1, $2, $3, $4, $5)`, defaultTenantID, "child", "submitter", "cap.child", waitDeps); err != nil {
 		t.Fatalf("submit child: %v", err)
 	}
 
@@ -1313,7 +1317,7 @@ func TestPartialDependencyRelease(t *testing.T) {
 		t.Fatalf("expected dep-b second, got %s", bJob)
 	}
 
-	if _, err := testDB.Exec(`SELECT pgwf.complete_job($1, $2, $3)`, aJob, aLease, "worker-a"); err != nil {
+	if _, err := testDB.Exec(`SELECT pgwf.complete_job($1, $2, $3, $4)`, defaultTenantID, aJob, aLease, "worker-a"); err != nil {
 		t.Fatalf("complete dep-a: %v", err)
 	}
 
@@ -1327,7 +1331,7 @@ func TestPartialDependencyRelease(t *testing.T) {
 
 	expectNoWork(t, []string{"cap.child"})
 
-	if _, err := testDB.Exec(`SELECT pgwf.complete_job($1, $2, $3)`, bJob, bLease, "worker-b"); err != nil {
+	if _, err := testDB.Exec(`SELECT pgwf.complete_job($1, $2, $3, $4)`, defaultTenantID, bJob, bLease, "worker-b"); err != nil {
 		t.Fatalf("complete dep-b: %v", err)
 	}
 
@@ -1348,10 +1352,10 @@ func TestPartialDependencyRelease(t *testing.T) {
 func TestSubmitJobFiltersArchivedDependencies(t *testing.T) {
 	resetTables(t)
 
-	if _, err := testDB.Exec(`SELECT pgwf.submit_job($1, $2, $3)`, "dep-live", "submitter", "cap.live"); err != nil {
+	if _, err := testDB.Exec(`SELECT pgwf.submit_job($1, $2, $3, $4)`, defaultTenantID, "dep-live", "submitter", "cap.live"); err != nil {
 		t.Fatalf("submit dep-live: %v", err)
 	}
-	if _, err := testDB.Exec(`SELECT pgwf.submit_job($1, $2, $3)`, "dep-arch", "submitter", "cap.arch"); err != nil {
+	if _, err := testDB.Exec(`SELECT pgwf.submit_job($1, $2, $3, $4)`, defaultTenantID, "dep-arch", "submitter", "cap.arch"); err != nil {
 		t.Fatalf("submit dep-arch: %v", err)
 	}
 
@@ -1359,21 +1363,21 @@ func TestSubmitJobFiltersArchivedDependencies(t *testing.T) {
 	if jobID != "dep-arch" {
 		t.Fatalf("expected dep-arch, got %s", jobID)
 	}
-	if _, err := testDB.Exec(`SELECT pgwf.complete_job($1, $2, $3)`, jobID, leaseID, "worker-arch"); err != nil {
+	if _, err := testDB.Exec(`SELECT pgwf.complete_job($1, $2, $3, $4)`, defaultTenantID, jobID, leaseID, "worker-arch"); err != nil {
 		t.Fatalf("complete dep-arch: %v", err)
 	}
 
 	var childID string
 	err := testDB.QueryRow(
-		`SELECT job_id FROM pgwf.submit_job($1, $2, $3, $4)`,
-		"child", "submitter", "cap.child", pqStringArray([]string{"dep-arch", "dep-live"}),
+		`SELECT job_id FROM pgwf.submit_job($1, $2, $3, $4, $5)`,
+		defaultTenantID, "child", "submitter", "cap.child", pqStringArray([]string{"dep-arch", "dep-live"}),
 	).Scan(&childID)
 	if err != nil {
 		t.Fatalf("submit child: %v", err)
 	}
 
 	var waitFor pqStringArray
-	if err := testDB.QueryRow(`SELECT wait_for FROM pgwf.jobs WHERE job_id = 'child'`).Scan(&waitFor); err != nil {
+	if err := testDB.QueryRow(`SELECT wait_for FROM pgwf.jobs WHERE tenant_id = $1 AND job_id = $2`, defaultTenantID, "child").Scan(&waitFor); err != nil {
 		t.Fatalf("query child wait_for: %v", err)
 	}
 	if len(waitFor) != 1 || waitFor[0] != "dep-live" {
@@ -1384,10 +1388,10 @@ func TestSubmitJobFiltersArchivedDependencies(t *testing.T) {
 func TestSubmitJobWaitsOnActiveJob(t *testing.T) {
 	resetTables(t)
 
-	if _, err := testDB.Exec(`SELECT pgwf.submit_job($1, $2, $3)`, "dep-active", "submitter", "cap.dep.active"); err != nil {
+	if _, err := testDB.Exec(`SELECT pgwf.submit_job($1, $2, $3, $4)`, defaultTenantID, "dep-active", "submitter", "cap.dep.active"); err != nil {
 		t.Fatalf("submit dep-active: %v", err)
 	}
-	if _, err := testDB.Exec(`SELECT pgwf.submit_job($1, $2, $3, $4)`, "child", "submitter", "cap.child", pqStringArray([]string{"dep-active"})); err != nil {
+	if _, err := testDB.Exec(`SELECT pgwf.submit_job($1, $2, $3, $4, $5)`, defaultTenantID, "child", "submitter", "cap.child", pqStringArray([]string{"dep-active"})); err != nil {
 		t.Fatalf("submit child: %v", err)
 	}
 
@@ -1405,7 +1409,7 @@ func TestSubmitJobWaitsOnActiveJob(t *testing.T) {
 	if depJob != "dep-active" {
 		t.Fatalf("expected dep-active lease, got %s", depJob)
 	}
-	if _, err := testDB.Exec(`SELECT pgwf.complete_job($1, $2, $3)`, depJob, depLease, "worker-dep"); err != nil {
+	if _, err := testDB.Exec(`SELECT pgwf.complete_job($1, $2, $3, $4)`, defaultTenantID, depJob, depLease, "worker-dep"); err != nil {
 		t.Fatalf("complete dep-active: %v", err)
 	}
 
@@ -1419,8 +1423,8 @@ func TestSubmitJobWaitForUnknownError(t *testing.T) {
 	resetTables(t)
 
 	_, err := testDB.Exec(
-		`SELECT pgwf.submit_job($1, $2, $3, $4)`,
-		"child", "submitter", "cap.child", pqStringArray([]string{"unknown"}),
+		`SELECT pgwf.submit_job($1, $2, $3, $4, $5)`,
+		defaultTenantID, "child", "submitter", "cap.child", pqStringArray([]string{"unknown"}),
 	)
 	expectErrorContains(t, err, "wait_for references unknown jobs")
 }
@@ -1428,13 +1432,13 @@ func TestSubmitJobWaitForUnknownError(t *testing.T) {
 func TestRescheduleWaitForValidation(t *testing.T) {
 	resetTables(t)
 
-	if _, err := testDB.Exec(`SELECT pgwf.submit_job($1, $2, $3)`, "dep-resched", "submitter", "cap.dep.active"); err != nil {
+	if _, err := testDB.Exec(`SELECT pgwf.submit_job($1, $2, $3, $4)`, defaultTenantID, "dep-resched", "submitter", "cap.dep.active"); err != nil {
 		t.Fatalf("submit dep-resched: %v", err)
 	}
-	if _, err := testDB.Exec(`SELECT pgwf.submit_job($1, $2, $3)`, "dep-old", "submitter", "cap.dep.old"); err != nil {
+	if _, err := testDB.Exec(`SELECT pgwf.submit_job($1, $2, $3, $4)`, defaultTenantID, "dep-old", "submitter", "cap.dep.old"); err != nil {
 		t.Fatalf("submit dep-old: %v", err)
 	}
-	if _, err := testDB.Exec(`SELECT pgwf.submit_job($1, $2, $3)`, "job-resched-wait", "submitter", "cap.target"); err != nil {
+	if _, err := testDB.Exec(`SELECT pgwf.submit_job($1, $2, $3, $4)`, defaultTenantID, "job-resched-wait", "submitter", "cap.target"); err != nil {
 		t.Fatalf("submit job-resched-wait: %v", err)
 	}
 
@@ -1442,7 +1446,7 @@ func TestRescheduleWaitForValidation(t *testing.T) {
 	if oldJob != "dep-old" {
 		t.Fatalf("expected dep-old lease, got %s", oldJob)
 	}
-	if _, err := testDB.Exec(`SELECT pgwf.complete_job($1, $2, $3)`, oldJob, oldLease, "worker-old"); err != nil {
+	if _, err := testDB.Exec(`SELECT pgwf.complete_job($1, $2, $3, $4)`, defaultTenantID, oldJob, oldLease, "worker-old"); err != nil {
 		t.Fatalf("complete dep-old: %v", err)
 	}
 
@@ -1453,14 +1457,14 @@ func TestRescheduleWaitForValidation(t *testing.T) {
 
 	var dummy string
 	err := testDB.QueryRow(
-		`SELECT job_id FROM pgwf.reschedule_job($1, $2, $3, $4, $5, $6)`,
-		jobID, leaseID, "worker", "cap.target", pqStringArray([]string{"unknown"}), time.Now(),
+		`SELECT job_id FROM pgwf.reschedule_job($1, $2, $3, $4, $5, $6, $7, $8)`,
+		defaultTenantID, jobID, leaseID, "worker", "cap.target", pqStringArray([]string{"unknown"}), time.Now(), nil,
 	).Scan(&dummy)
 	expectErrorContains(t, err, "wait_for references unknown jobs")
 
 	err = testDB.QueryRow(
-		`SELECT job_id FROM pgwf.reschedule_job($1, $2, $3, $4, $5, $6)`,
-		jobID, leaseID, "worker", "cap.target", pqStringArray([]string{"dep-resched", "dep-old"}), time.Now(),
+		`SELECT job_id FROM pgwf.reschedule_job($1, $2, $3, $4, $5, $6, $7, $8)`,
+		defaultTenantID, jobID, leaseID, "worker", "cap.target", pqStringArray([]string{"dep-resched", "dep-old"}), time.Now(), nil,
 	).Scan(&dummy)
 	if err != nil {
 		t.Fatalf("reschedule with filtered wait_for: %v", err)
@@ -1478,10 +1482,10 @@ func TestRescheduleWaitForValidation(t *testing.T) {
 func TestRescheduleAllowsActiveDependency(t *testing.T) {
 	resetTables(t)
 
-	if _, err := testDB.Exec(`SELECT pgwf.submit_job($1, $2, $3)`, "dep-active-resched", "submitter", "cap.dep.active"); err != nil {
+	if _, err := testDB.Exec(`SELECT pgwf.submit_job($1, $2, $3, $4)`, defaultTenantID, "dep-active-resched", "submitter", "cap.dep.active"); err != nil {
 		t.Fatalf("submit dependency: %v", err)
 	}
-	if _, err := testDB.Exec(`SELECT pgwf.submit_job($1, $2, $3)`, "job-target", "submitter", "cap.target"); err != nil {
+	if _, err := testDB.Exec(`SELECT pgwf.submit_job($1, $2, $3, $4)`, defaultTenantID, "job-target", "submitter", "cap.target"); err != nil {
 		t.Fatalf("submit job-target: %v", err)
 	}
 
@@ -1489,8 +1493,8 @@ func TestRescheduleAllowsActiveDependency(t *testing.T) {
 
 	var rescheduled string
 	if err := testDB.QueryRow(
-		`SELECT job_id FROM pgwf.reschedule_job($1, $2, $3, $4, $5, $6)`,
-		jobID, leaseID, "worker-target", "cap.target", pqStringArray([]string{"dep-active-resched"}), time.Now(),
+		`SELECT job_id FROM pgwf.reschedule_job($1, $2, $3, $4, $5, $6, $7, $8)`,
+		defaultTenantID, jobID, leaseID, "worker-target", "cap.target", pqStringArray([]string{"dep-active-resched"}), time.Now(), nil,
 	).Scan(&rescheduled); err != nil {
 		t.Fatalf("reschedule target: %v", err)
 	}
@@ -1512,7 +1516,7 @@ func TestRescheduleAllowsActiveDependency(t *testing.T) {
 	if depJob != "dep-active-resched" {
 		t.Fatalf("expected dependency lease, got %s", depJob)
 	}
-	if _, err := testDB.Exec(`SELECT pgwf.complete_job($1, $2, $3)`, depJob, depLease, "worker-dep"); err != nil {
+	if _, err := testDB.Exec(`SELECT pgwf.complete_job($1, $2, $3, $4)`, defaultTenantID, depJob, depLease, "worker-dep"); err != nil {
 		t.Fatalf("complete dependency: %v", err)
 	}
 
@@ -1525,11 +1529,11 @@ func TestRescheduleAllowsActiveDependency(t *testing.T) {
 func TestCompleteUnheldJob(t *testing.T) {
 	resetTables(t)
 
-	if _, err := testDB.Exec(`SELECT pgwf.submit_job($1, $2, $3)`, "job-free", "worker", "cap.gamma"); err != nil {
+	if _, err := testDB.Exec(`SELECT pgwf.submit_job($1, $2, $3, $4)`, defaultTenantID, "job-free", "worker", "cap.gamma"); err != nil {
 		t.Fatalf("submit job-free: %v", err)
 	}
 
-	if _, err := testDB.Exec(`SELECT pgwf.complete_unheld_job($1, $2)`, "job-free", "worker"); err != nil {
+	if _, err := testDB.Exec(`SELECT pgwf.complete_unheld_job($1, $2, $3)`, defaultTenantID, "job-free", "worker"); err != nil {
 		t.Fatalf("complete_unheld_job: %v", err)
 	}
 
@@ -1540,15 +1544,15 @@ func TestCompleteUnheldJob(t *testing.T) {
 		t.Fatalf("job should exist in archive")
 	}
 
-	if _, err := testDB.Exec(`SELECT pgwf.complete_unheld_job($1, $2)`, "job-missing", "worker"); err == nil || !strings.Contains(err.Error(), "is not available") {
+	if _, err := testDB.Exec(`SELECT pgwf.complete_unheld_job($1, $2, $3)`, defaultTenantID, "job-missing", "worker"); err == nil || !strings.Contains(err.Error(), "is not available") {
 		t.Fatalf("expected error for missing job, got %v", err)
 	}
 
 	// Future job should not be completable without a lease.
-	if _, err := testDB.Exec(`SELECT pgwf.submit_job($1, $2, $3, $4, $5, $6, $7)`, "job-future", "worker", "cap.zeta", nil, nil, nil, time.Now().Add(time.Hour)); err != nil {
+	if _, err := testDB.Exec(`SELECT pgwf.submit_job($1, $2, $3, $4, $5, $6, $7, $8)`, defaultTenantID, "job-future", "worker", "cap.zeta", nil, nil, nil, time.Now().Add(time.Hour)); err != nil {
 		t.Fatalf("submit future job: %v", err)
 	}
-	if _, err := testDB.Exec(`SELECT pgwf.complete_unheld_job($1, $2)`, "job-future", "worker"); err == nil || !strings.Contains(err.Error(), "is not available") {
+	if _, err := testDB.Exec(`SELECT pgwf.complete_unheld_job($1, $2, $3)`, defaultTenantID, "job-future", "worker"); err == nil || !strings.Contains(err.Error(), "is not available") {
 		t.Fatalf("expected future job error, got %v", err)
 	}
 }
@@ -1556,14 +1560,14 @@ func TestCompleteUnheldJob(t *testing.T) {
 func TestRescheduleUnheldJob(t *testing.T) {
 	resetTables(t)
 
-	if _, err := testDB.Exec(`SELECT pgwf.submit_job($1, $2, $3)`, "job-free", "worker", "cap.delta"); err != nil {
+	if _, err := testDB.Exec(`SELECT pgwf.submit_job($1, $2, $3, $4)`, defaultTenantID, "job-free", "worker", "cap.delta"); err != nil {
 		t.Fatalf("submit job-free: %v", err)
 	}
 
 	rows, err := testDB.Query(`
         SELECT job_id, next_need
-        FROM pgwf.reschedule_unheld_job($1, $2, $3, $4, $5)
-    `, "job-free", "worker", "cap.theta", nil, time.Now().Add(time.Hour))
+        FROM pgwf.reschedule_unheld_job($1, $2, $3, $4, $5, $6, $7)
+    `, defaultTenantID, "job-free", "worker", "cap.theta", pqStringArray(nil), time.Now().Add(time.Hour), nil)
 	if err != nil {
 		t.Fatalf("reschedule_unheld_job: %v", err)
 	}
@@ -1583,17 +1587,17 @@ func TestRescheduleUnheldJob(t *testing.T) {
 		t.Fatalf("expected single reschedule result")
 	}
 
-	if _, err := testDB.Exec(`SELECT pgwf.reschedule_unheld_job($1, $2, $3)`, "job-missing", "worker", "cap"); err == nil || !strings.Contains(err.Error(), "is not available") {
+	if _, err := testDB.Exec(`SELECT pgwf.reschedule_unheld_job($1, $2, $3, $4)`, defaultTenantID, "job-missing", "worker", "cap"); err == nil || !strings.Contains(err.Error(), "is not available") {
 		t.Fatalf("expected error for missing job, got %v", err)
 	}
 
 	// Leased jobs should not be rescheduled via the unheld helper.
 	resetTables(t)
-	if _, err := testDB.Exec(`SELECT pgwf.submit_job($1, $2, $3)`, "job-leased", "worker", "cap.leased"); err != nil {
+	if _, err := testDB.Exec(`SELECT pgwf.submit_job($1, $2, $3, $4)`, defaultTenantID, "job-leased", "worker", "cap.leased"); err != nil {
 		t.Fatalf("submit job-leased: %v", err)
 	}
 	leasedJob, _ := leaseSingleJob(t, []string{"cap.leased"})
-	if _, err := testDB.Exec(`SELECT pgwf.reschedule_unheld_job($1, $2, $3)`, leasedJob, "worker", "cap.other"); err == nil || !strings.Contains(err.Error(), "is not available") {
+	if _, err := testDB.Exec(`SELECT pgwf.reschedule_unheld_job($1, $2, $3, $4, $5, $6, $7)`, defaultTenantID, leasedJob, "worker", "cap.other", pqStringArray(nil), nil, nil); err == nil || !strings.Contains(err.Error(), "is not available") {
 		t.Fatalf("expected leased job error, got %v", err)
 	}
 }
@@ -1605,7 +1609,7 @@ func TestCrashConcernCountingAndClearing(t *testing.T) {
 		t.Fatalf("set crash threshold: %v", err)
 	}
 
-	if _, err := testDB.Exec(`SELECT pgwf.submit_job($1, $2, $3)`, "job-crash", "submitter", "cap.crash"); err != nil {
+	if _, err := testDB.Exec(`SELECT pgwf.submit_job($1, $2, $3, $4)`, defaultTenantID, "job-crash", "submitter", "cap.crash"); err != nil {
 		t.Fatalf("submit job-crash: %v", err)
 	}
 
@@ -1658,7 +1662,7 @@ func TestCrashConcernCountingAndClearing(t *testing.T) {
 		t.Fatalf("expected 1 increment trace, got %d", traceCount)
 	}
 
-	if _, err := testDB.Exec(`SELECT pgwf.clear_crash_concern($1, $2, $3)`, jobID, "operator", "ack"); err != nil {
+	if _, err := testDB.Exec(`SELECT pgwf.clear_crash_concern($1, $2, $3, $4)`, defaultTenantID, jobID, "operator", "ack"); err != nil {
 		t.Fatalf("clear crash concern failed: %v", err)
 	}
 
@@ -1693,7 +1697,7 @@ func TestCrashConcernCountingAndClearing(t *testing.T) {
 func TestRescheduleClearsCrashConcern(t *testing.T) {
 	resetTables(t)
 
-	if _, err := testDB.Exec(`SELECT pgwf.submit_job($1, $2, $3)`, "job-resched", "submitter", "cap.resched"); err != nil {
+	if _, err := testDB.Exec(`SELECT pgwf.submit_job($1, $2, $3, $4)`, defaultTenantID, "job-resched", "submitter", "cap.resched"); err != nil {
 		t.Fatalf("submit job-resched: %v", err)
 	}
 
@@ -1718,11 +1722,12 @@ func TestRescheduleClearsCrashConcern(t *testing.T) {
 
 	var rescheduled string
 	err := testDB.QueryRow(
-		`SELECT job_id FROM pgwf.reschedule_job($1, $2, $3, $4)`,
-		jobID,
+		`SELECT job_id FROM pgwf.reschedule_job($1, $2, $3, $4, $5, $6, $7, $8)`,
+		defaultTenantID, jobID,
 		newLease,
 		"worker",
 		"cap.resched",
+		pqStringArray(nil), nil, nil,
 	).Scan(&rescheduled)
 	if err != nil {
 		t.Fatalf("reschedule_job failed: %v", err)
@@ -1746,7 +1751,7 @@ func TestCompleteUnheldCrashConcern(t *testing.T) {
 		t.Fatalf("set crash threshold: %v", err)
 	}
 
-	if _, err := testDB.Exec(`SELECT pgwf.submit_job($1, $2, $3)`, "job-crash-complete", "submitter", "cap.crash.complete"); err != nil {
+	if _, err := testDB.Exec(`SELECT pgwf.submit_job($1, $2, $3, $4)`, defaultTenantID, "job-crash-complete", "submitter", "cap.crash.complete"); err != nil {
 		t.Fatalf("submit job-crash-complete: %v", err)
 	}
 
@@ -1775,7 +1780,7 @@ func TestCompleteUnheldCrashConcern(t *testing.T) {
 		t.Fatalf("expected CRASH_CONCERN status, got %s", status)
 	}
 
-	if _, err := testDB.Exec(`SELECT pgwf.complete_unheld_job($1, $2)`, jobID, "operator"); err != nil {
+	if _, err := testDB.Exec(`SELECT pgwf.complete_unheld_job($1, $2, $3)`, defaultTenantID, jobID, "operator"); err != nil {
 		t.Fatalf("complete_unheld_job failed: %v", err)
 	}
 
@@ -1794,7 +1799,7 @@ func TestCompleteUnheldCrashConcern(t *testing.T) {
 
 func leaseSingleJob(t *testing.T, caps []string) (string, string) {
 	t.Helper()
-	rows, err := testDB.Query(`SELECT job_id, lease_id FROM pgwf.get_work($1, $2, $3, $4)`, "worker", pqStringArray(caps), 30, 1)
+	rows, err := testDB.Query(`SELECT tenant_id, job_id, lease_id FROM pgwf.get_work($1, $2, $3, $4, $5)`, "worker", pqStringArray(caps), nil, 30, 1)
 	if err != nil {
 		t.Fatalf("get_work failed: %v", err)
 	}
@@ -1804,8 +1809,8 @@ func leaseSingleJob(t *testing.T, caps []string) (string, string) {
 		t.Fatalf("expected a row")
 	}
 
-	var jobID, leaseID string
-	if err := rows.Scan(&jobID, &leaseID); err != nil {
+	var tenantID, jobID, leaseID string
+	if err := rows.Scan(&tenantID, &jobID, &leaseID); err != nil {
 		t.Fatalf("scan: %v", err)
 	}
 
@@ -1863,7 +1868,7 @@ func expectErrorContains(t *testing.T, err error, substr string) {
 
 func expectNoWork(t *testing.T, caps []string) {
 	t.Helper()
-	rows, err := testDB.Query(`SELECT job_id FROM pgwf.get_work($1, $2, $3, $4)`, "worker", pqStringArray(caps), 30, 1)
+	rows, err := testDB.Query(`SELECT tenant_id, job_id FROM pgwf.get_work($1, $2, $3, $4, $5)`, "worker", pqStringArray(caps), nil, 30, 1)
 	if err != nil {
 		t.Fatalf("get_work: %v", err)
 	}

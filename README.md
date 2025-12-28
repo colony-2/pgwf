@@ -12,30 +12,31 @@ pgwf (Postgres Workflow) is a pure-SQL workflow engine. It's built specifically 
 
 | Function          | Description                                                                                                            | Signature                                                                                                                                   |
 |-------------------|------------------------------------------------------------------------------------------------------------------------|---------------------------------------------------------------------------------------------------------------------------------------------|
-| `submit_job` | Inserts a new job, validates dependencies, attaches an optional payload, and (optionally) emits notifications for `next_need`. | `submit_job(job_id TEXT, worker_id TEXT, next_need TEXT, wait_for TEXT[], payload JSONB, singleton_key TEXT, available_at TIMESTAMPTZ, expires_at TIMESTAMPTZ)` |
-| `get_work`        | Leases up to `limit_jobs` that match the supplied capabilities, assigning a fresh `lease_id` and visibility timeout.   | `get_work(worker_id TEXT, worker_caps TEXT[], lease_seconds INT, limit_jobs INT)`                                                           |
-| `extend_lease`    | Heartbeats an active lease by pushing `lease_expires_at` into the future.                                              | `extend_lease(job_id TEXT, lease_id TEXT, worker_id TEXT, additional_seconds INT)`                                                          |
-| `reschedule_job`  | Returns a leased job to the queue with updated capability/dependency metadata, optional payload override, and clears the lease. | `reschedule_job(job_id TEXT, lease_id TEXT, worker_id TEXT, next_need TEXT, wait_for TEXT[], available_at TIMESTAMPTZ, payload JSONB)` |
-| `reschedule_unheld_job` | Mutates any `READY` job’s metadata/availability (including optional payload override) without first needing a lease.      | `reschedule_unheld_job(job_id TEXT, worker_id TEXT, next_need TEXT, wait_for TEXT[], available_at TIMESTAMPTZ, payload JSONB)`         |
-| `complete_job`    | Archives the job, deletes it from `pgwf.jobs`, removes the job_id from dependents, and wakes listeners.                | `complete_job(job_id TEXT, lease_id TEXT, worker_id TEXT)`                                                                                  |
-| `complete_unheld_job` | Archives a `READY` job that locking and completing in a single op (and unblocking dependent work/notifying as needed). | `complete_unheld_job(job_id TEXT, worker_id TEXT)`                                                                                          |
-| `cancel_job` | Marks a job for cancellation, preventing additional leases, extensions, or reschedules while capturing who requested it. | `cancel_job(job_id TEXT, worker_id TEXT, reason TEXT)` |
-| `archive_cancelled_jobs` | Bulk-archives cancelled jobs whose leases have expired, removes dependencies, and emits aggregate traces. | `archive_cancelled_jobs(worker_id TEXT, limit INTEGER)` |
+| `submit_job` | Inserts a new job, validates dependencies, attaches an optional payload, and (optionally) emits notifications for `next_need`. | `submit_job(tenant_id TEXT, job_id TEXT, worker_id TEXT, next_need TEXT, wait_for TEXT[], payload JSONB, singleton_key TEXT, available_at TIMESTAMPTZ, expires_at TIMESTAMPTZ)` |
+| `get_work`        | Leases up to `limit_jobs` that match the supplied capabilities and optional tenant filter, assigning a fresh `lease_id` and visibility timeout.   | `get_work(worker_id TEXT, worker_caps TEXT[], tenant_ids TEXT[], lease_seconds INT, limit_jobs INT)`                                                           |
+| `extend_lease`    | Heartbeats an active lease by pushing `lease_expires_at` into the future.                                              | `extend_lease(tenant_id TEXT, job_id TEXT, lease_id TEXT, worker_id TEXT, additional_seconds INT)`                                                          |
+| `reschedule_job`  | Returns a leased job to the queue with updated capability/dependency metadata, optional payload override, and clears the lease. | `reschedule_job(tenant_id TEXT, job_id TEXT, lease_id TEXT, worker_id TEXT, next_need TEXT, wait_for TEXT[], available_at TIMESTAMPTZ, payload JSONB)` |
+| `reschedule_unheld_job` | Mutates any `READY` job's metadata/availability (including optional payload override) without first needing a lease.      | `reschedule_unheld_job(tenant_id TEXT, job_id TEXT, worker_id TEXT, next_need TEXT, wait_for TEXT[], available_at TIMESTAMPTZ, payload JSONB)`         |
+| `complete_job`    | Archives the job, deletes it from `pgwf.jobs`, removes the job_id from dependents, and wakes listeners.                | `complete_job(tenant_id TEXT, job_id TEXT, lease_id TEXT, worker_id TEXT)`                                                                                  |
+| `complete_unheld_job` | Archives a `READY` job that locking and completing in a single op (and unblocking dependent work/notifying as needed). | `complete_unheld_job(tenant_id TEXT, job_id TEXT, worker_id TEXT)`                                                                                          |
+| `cancel_job` | Marks a job for cancellation, preventing additional leases, extensions, or reschedules while capturing who requested it. | `cancel_job(tenant_id TEXT, job_id TEXT, worker_id TEXT, reason TEXT)` |
+| `archive_cancelled_jobs` | Bulk-archives cancelled jobs whose leases have expired, removes dependencies, and emits aggregate traces. | `archive_cancelled_jobs(worker_id TEXT, tenant_ids TEXT[], limit INTEGER)` |
+| `clear_crash_concern` | Resets consecutive expiration counter for a job stuck in CRASH_CONCERN status. | `clear_crash_concern(tenant_id TEXT, job_id TEXT, worker_id TEXT, reason TEXT)` |
 
 ### Backing Tables
 
 | Table | Columns (summary) | Purpose |
 |-------|-------------------|---------|
-| `jobs` | `job_id`, `next_need`, `wait_for[]`, `payload`, `singleton_key`, `available_at`, `expires_at`, `lease_id`, `lease_expires_at`, `lease_expiration_count`, `consecutive_expirations`, timestamps, cancellation metadata | Live job metadata for runnable/leased/delayed jobs plus crash-concern counters. |
-| `jobs_archive` | `job_id`, `next_need`, `wait_for[]`, `payload`, `singleton_key`, `created_at`, `expires_at`, `lease_id`, `lease_expiration_count`, `consecutive_expirations`, `archived_at`, cancellation metadata | Immutable snapshot for completed or cancelled jobs; prevents `job_id` reuse while preserving historical counters. |
-| `jobs_trace` | `trace_id`, `job_id`, `event_type`, `worker_id`, `event_at`, `input_data`, `output_data` | Append-only audit log of every workflow call. |
+| `jobs` | `tenant_id`, `job_id`, `next_need`, `wait_for[]`, `payload`, `singleton_key`, `available_at`, `expires_at`, `lease_id`, `lease_expires_at`, `lease_expiration_count`, `consecutive_expirations`, timestamps, cancellation metadata | Live job metadata for runnable/leased/delayed jobs plus crash-concern counters. Primary key: `(tenant_id, job_id)`. |
+| `jobs_archive` | `tenant_id`, `job_id`, `next_need`, `wait_for[]`, `payload`, `singleton_key`, `created_at`, `expires_at`, `lease_id`, `lease_expiration_count`, `consecutive_expirations`, `archived_at`, cancellation metadata | Immutable snapshot for completed or cancelled jobs; prevents `job_id` reuse within same tenant. Primary key: `(tenant_id, job_id)`. |
+| `jobs_trace` | `trace_id`, `tenant_id`, `job_id`, `event_type`, `worker_id`, `event_at`, `input_data`, `output_data` | Append-only audit log of every workflow call, scoped per tenant. |
 
 ### Views
 
 | View | Columns (summary) | Purpose |
 |------|-------------------|---------|
-| `jobs_with_status` | `jobs.*` plus computed `status` (`READY`, `PENDING_JOBS`, `AWAITING_FUTURE`, `ACTIVE`, `CRASH_CONCERN`, `EXPIRED`, `CANCELLED`) | Primary locking surface for functions that care about availability + lease state. |
-| `jobs_friendly_status` | `job_id`, `status`, human-oriented columns (`creation_dt`, `pending_jobs`, `sleep_until`, `worker_id`, `cancelled_at`, `cancelled_by`, `expires_at`, `payload`) | Convenience view for monitoring dashboards or ad-hoc inspection. |
+| `jobs_with_status` | `tenant_id`, `jobs.*` plus computed `status` (`READY`, `PENDING_JOBS`, `AWAITING_FUTURE`, `ACTIVE`, `CRASH_CONCERN`, `EXPIRED`, `CANCELLED`) | Primary locking surface for functions that care about availability + lease state. Status computation respects tenant boundaries for dependencies. |
+| `jobs_friendly_status` | `tenant_id`, `job_id`, `status`, human-oriented columns (`creation_dt`, `pending_jobs`, `sleep_until`, `worker_id`, `cancelled_at`, `cancelled_by`, `expires_at`, `payload`) | Convenience view for monitoring dashboards or ad-hoc inspection. |
 
 #### Job Status Definitions
 
@@ -60,6 +61,57 @@ pgwf (Postgres Workflow) is a pure-SQL workflow engine. It's built specifically 
 
 The workflow engine patterns here are inspired in part by durable execution systems including [dbos](https://github.com/dbos-inc), [restate](https://github.com/restatedev/restate) and [temporal](https://github.com/temporalio/temporal). The implementation is inspired by [pgmq](https://github.com/tembo-io/pgmq)—particularly its disciplined use of SQL functions, visibility timeouts, and lightweight queue semantics.
 
+
+## Multi-Tenancy
+
+pgwf supports multi-tenancy through a composite primary key `(tenant_id, job_id)` on all core tables. This provides complete data isolation between tenants at the database level while allowing efficient resource sharing.
+
+### Key Multi-Tenant Characteristics
+
+- **Tenant Isolation**: Jobs are scoped per tenant. Dependencies (`wait_for`) can only reference jobs within the same tenant, preventing cross-tenant leakage.
+- **Singleton Keys**: `singleton_key` constraints are scoped per tenant, allowing different tenants to have active jobs with the same key simultaneously.
+- **Worker Flexibility**: Workers can serve multiple tenants or be dedicated to specific tenants via the `tenant_ids` parameter in `get_work()`.
+- **Tenant Filtering**: Operations like `get_work()` and `archive_cancelled_jobs()` accept optional `tenant_ids TEXT[]` parameter:
+  - `NULL` or `'{}'`: Operate across all tenants
+  - `'{tenant1}'`: Operate only on tenant1
+  - `'{tenant1, tenant2}'`: Operate only on these tenants
+- **Performance**: Tenant-aware indexes ensure efficient query performance even with millions of jobs across thousands of tenants.
+
+### Multi-Tenant Example
+
+```sql
+-- Tenant A submits a job
+SELECT * FROM pgwf.submit_job(
+    p_tenant_id => 'acme_corp',
+    p_job_id => 'job-123',
+    p_worker_id => 'ingest-service',
+    p_next_need => 'python.process'
+);
+
+-- Tenant B submits a job with the same job_id (allowed - different tenant)
+SELECT * FROM pgwf.submit_job(
+    p_tenant_id => 'globex_inc',
+    p_job_id => 'job-123',  -- Same job_id, different tenant
+    p_worker_id => 'ingest-service',
+    p_next_need => 'python.process'
+);
+
+-- Multi-tenant worker gets work from all tenants
+SELECT tenant_id, job_id, lease_id
+FROM pgwf.get_work(
+    p_worker_id => 'worker-1',
+    p_worker_caps => ARRAY['python.process'],
+    p_tenant_ids => NULL  -- All tenants
+);
+
+-- Single-tenant worker gets work from specific tenant
+SELECT tenant_id, job_id, lease_id
+FROM pgwf.get_work(
+    p_worker_id => 'worker-2',
+    p_worker_caps => ARRAY['python.process'],
+    p_tenant_ids => ARRAY['acme_corp']  -- Only acme_corp
+);
+```
 
 ## Garden Variety Use
 
@@ -157,14 +209,14 @@ Because pgwf is implemented entirely inside Postgres, job creation can live insi
 ```sql
 BEGIN;
 INSERT INTO invoices (invoice_id, total_cents, status) VALUES ('inv-42', 12345, 'pending');
-SELECT pgwf.submit_job('inv-42', 'billing-service', 'invoice.collect', ARRAY[]::TEXT[], 'customer-123', clock_timestamp());
+SELECT pgwf.submit_job('customer-123', 'inv-42', 'billing-service', 'invoice.collect', ARRAY[]::TEXT[]);
 COMMIT;
 ```
 
 ```sql
 BEGIN;
 INSERT INTO invoices (invoice_id, total_cents, status) VALUES ('inv-42', 12345, 'completed');
-SELECT pgwf.complete_job('inv-42', 'lease1234', 'PROD;HUMAN-REVIEW;jim@oheir.org');
+SELECT pgwf.complete_job('customer-123', 'inv-42', 'lease1234', 'PROD;HUMAN-REVIEW;jim@oheir.org');
 COMMIT;
 ```
 
@@ -187,8 +239,9 @@ If the transaction commits, both the invoice row and the workflow job become dur
 2. **Submit metadata** – The producer calls `pgwf.submit_job(job_id, worker_id, next_need, wait_for, singleton_key, available_at)` to register the work. Example:
 
     ```sql
-    SELECT job_id
+    SELECT tenant_id, job_id
     FROM pgwf.submit_job(
+        p_tenant_id     => 'customer-42',
         p_job_id        => 'job-123',
         p_worker_id     => 'ingest-service',
         p_next_need     => 'transcode.video',
@@ -199,10 +252,10 @@ If the transaction commits, both the invoice row and the workflow job become dur
     ```
    The singleton key (if any) is fixed at submission time; subsequent reschedules do not accept or alter it.
 
-3. **Workers poll** – Workers call `pgwf.get_work(worker_id, worker_caps, lease_seconds, limit_jobs)` to lease jobs. When notifications are enabled they also `LISTEN pgwf.need.<capability>` to wake up instantly; otherwise they simply poll. Each lease returns full metadata plus a fresh `lease_id`. A “python” worker might perform ETL, while a “human-review” worker handles compliance later.
-4. **Process + heartbeat** – While running, workers use `pgwf.extend_lease(job_id, lease_id, worker_id, additional_seconds)` to keep ownership. If they expect a long pause, they can reschedule themselves with a future `available_at`.
+3. **Workers poll** – Workers call `pgwf.get_work(worker_id, worker_caps, tenant_ids, lease_seconds, limit_jobs)` to lease jobs. When notifications are enabled they also `LISTEN pgwf.need.<capability>` to wake up instantly; otherwise they simply poll. Each lease returns full metadata plus a fresh `lease_id`. A "python" worker might perform ETL, while a "human-review" worker handles compliance later.
+4. **Process + heartbeat** – While running, workers use `pgwf.extend_lease(tenant_id, job_id, lease_id, worker_id, additional_seconds)` to keep ownership. If they expect a long pause, they can reschedule themselves with a future `available_at`.
 5. **Reschedule when blocked** – Workers mutate capability + dependencies via `pgwf.reschedule_job(...)`. Example: after splitting a video into 10 child jobs, the parent reschedules itself with `wait_for = ARRAY['child-1', ..., 'child-10']`. Each child completion removes its `job_id`; when the final one finishes, the parent becomes runnable automatically. Another example: a worker might reschedule itself with `next_need = 'human-review'` if it detects a compliance issue.
-6. **Complete** – After writing the final payload back to the journal, the worker calls `pgwf.complete_job(job_id, lease_id, worker_id)`. pgwf archives the row, deletes the live copy, removes the job_id from any dependent `wait_for` arrays, and emits NOTIFY signals to wake listeners (if enabled).
+6. **Complete** – After writing the final payload back to the journal, the worker calls `pgwf.complete_job(tenant_id, job_id, lease_id, worker_id)`. pgwf archives the row, deletes the live copy, removes the job_id from any dependent `wait_for` arrays, and emits NOTIFY signals to wake listeners (if enabled).
 
 Because the payload lives in the journal, pgwf focuses purely on orchestration metadata and leasing. If a worker crashes, the visibility timeout makes the job eligible again while the payload remains durable in the journal.
 
