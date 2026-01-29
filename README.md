@@ -160,6 +160,21 @@ Workers advertise capabilities via `worker_caps` when calling `get_work`. Jobs s
 
 Capabilities make it easy to run heterogeneous fleets (containers, serverless, humans) against the same queue without separate tables per team.
 
+#### Alternate capability fallback
+
+Optionally set `alternate_next_need` with `alternate_after_seconds`. While a job is READY and unleased, once `ready_since + alternate_after_seconds <= now()` the job’s **effective** capability pivots to `alternate_next_need`. The pivot is derived in `jobs_with_status` (column `effective_next_need`) so `get_work` routes using the active capability without mutating the stored `next_need`. No `NOTIFY` is emitted when the pivot occurs; workers relying on LISTEN should continue polling. Example submission:
+
+```sql
+SELECT pgwf.submit_job(
+    p_tenant_id => 'tenant-a',
+    p_job_id => 'doc-review',
+    p_worker_id => 'router',
+    p_next_need => 'human.review',
+    p_alternate_next_need => 'llm.review',
+    p_alternate_after_seconds => 300  -- fall back after 5 minutes
+);
+```
+
 ### Singleton keys
 
 `singleton_key` is an optional mutex scope. If all “billing for customer-42” jobs share `singleton_key = 'customer-42'`, pgwf ensures only one job with that key holds a lease at any time. This prevents concurrent workflows from trampling shared resources without involving advisory locks or external coordination.

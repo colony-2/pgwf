@@ -285,7 +285,7 @@ func TestPayloadValidation(t *testing.T) {
 		var tenantID, jobID, leaseID string
 		if err := testDB.QueryRow(
 			`SELECT tenant_id, job_id, lease_id FROM pgwf.get_work($1, $2, $3, $4, $5)`,
-		"worker-lease", pqStringArray([]string{"cap.payload"}), nil, 30, 1,
+			"worker-lease", pqStringArray([]string{"cap.payload"}), nil, 30, 1,
 		).Scan(&tenantID, &jobID, &leaseID); err != nil {
 			t.Fatalf("get_work: %v", err)
 		}
@@ -489,7 +489,7 @@ func TestSingletonImmutabilityOnReschedule(t *testing.T) {
 		var rescheduled string
 		if err := testDB.QueryRow(
 			`SELECT job_id FROM pgwf.reschedule_job($1, $2, $3, $4, $5, $6, $7, $8)`,
-		defaultTenantID, jobID, leaseID, "worker", "cap.single.next", pqStringArray(nil), nil, nil,
+			defaultTenantID, jobID, leaseID, "worker", "cap.single.next", pqStringArray(nil), nil, nil,
 		).Scan(&rescheduled); err != nil {
 			t.Fatalf("reschedule_job: %v", err)
 		}
@@ -718,7 +718,7 @@ func TestGetWorkErrors(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			rows, err := testDB.Query(
 				`SELECT * FROM pgwf.get_work($1, $2, $3, $4, $5)`,
-		"worker", pqStringArray(tc.caps), nil, tc.leaseSeconds, tc.limitJobs,
+				"worker", pqStringArray(tc.caps), nil, tc.leaseSeconds, tc.limitJobs,
 			)
 			if rows != nil {
 				rows.Close()
@@ -1382,6 +1382,116 @@ func TestSubmitJobFiltersArchivedDependencies(t *testing.T) {
 	}
 	if len(waitFor) != 1 || waitFor[0] != "dep-live" {
 		t.Fatalf("expected wait_for to retain only dep-live, got %v", waitFor)
+	}
+}
+
+func TestAlternateCapabilityImmediatePivot(t *testing.T) {
+	resetTables(t)
+
+	if _, err := testDB.Exec(
+		`SELECT pgwf.submit_job($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+		defaultTenantID, "job-alt-now", "submitter", "cap.primary", pqStringArray(nil), nil, nil, nil, nil, "cap.alt", 0,
+	); err != nil {
+		t.Fatalf("submit alternate job: %v", err)
+	}
+
+	// Should not lease via primary after pivot to alternate.
+	expectNoWork(t, []string{"cap.primary"})
+
+	jobID, _ := leaseSingleJob(t, []string{"cap.alt"})
+	if jobID != "job-alt-now" {
+		t.Fatalf("expected alternate capability to lease job-alt-now, got %s", jobID)
+	}
+}
+
+func TestAlternateCapabilityDelayedPivot(t *testing.T) {
+	resetTables(t)
+
+	if _, err := testDB.Exec(
+		`SELECT pgwf.submit_job($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+		defaultTenantID, "job-alt-delay", "submitter", "cap.primary.delay", pqStringArray(nil), nil, nil, nil, nil, "cap.alt.delay", 5,
+	); err != nil {
+		t.Fatalf("submit alternate delay job: %v", err)
+	}
+
+	// Before delay elapses, alternate capability should not see the job.
+	expectNoWork(t, []string{"cap.alt.delay"})
+
+	// Simulate passage of time so ready_since is well before the delay threshold.
+	if _, err := testDB.Exec(`UPDATE pgwf.jobs SET available_at = clock_timestamp() - interval '10 seconds', created_at = clock_timestamp() - interval '10 seconds' WHERE job_id = $1`, "job-alt-delay"); err != nil {
+		t.Fatalf("backdate job to trigger pivot: %v", err)
+	}
+
+	jobID, _ := leaseSingleJob(t, []string{"cap.alt.delay"})
+	if jobID != "job-alt-delay" {
+		t.Fatalf("expected pivot to alternate after delay, got %s", jobID)
+	}
+}
+
+func TestAlternateCapabilityRespectsDependencies(t *testing.T) {
+	resetTables(t)
+
+	if _, err := testDB.Exec(`SELECT pgwf.submit_job($1, $2, $3, $4)`, defaultTenantID, "blocker-alt", "submitter", "cap.blocker.alt"); err != nil {
+		t.Fatalf("submit blocker: %v", err)
+	}
+
+	waitDeps := pqStringArray([]string{"blocker-alt"})
+	if _, err := testDB.Exec(
+		`SELECT pgwf.submit_job($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+		defaultTenantID, "child-alt", "submitter", "cap.primary.alt", waitDeps, nil, nil, nil, nil, "cap.alt.child", 0,
+	); err != nil {
+		t.Fatalf("submit child with alternate: %v", err)
+	}
+
+	// While dependency outstanding, alternate should not lease.
+	expectNoWork(t, []string{"cap.alt.child"})
+
+	blockerID, blockerLease := leaseSingleJob(t, []string{"cap.blocker.alt"})
+	if blockerID != "blocker-alt" {
+		t.Fatalf("expected blocker-alt, got %s", blockerID)
+	}
+	if _, err := testDB.Exec(`SELECT pgwf.complete_job($1, $2, $3, $4)`, defaultTenantID, blockerID, blockerLease, "worker-blocker"); err != nil {
+		t.Fatalf("complete blocker: %v", err)
+	}
+
+	childID, _ := leaseSingleJob(t, []string{"cap.alt.child"})
+	if childID != "child-alt" {
+		t.Fatalf("expected child-alt to lease after dependency completion, got %s", childID)
+	}
+}
+
+func TestAlternateFieldsPersistInArchive(t *testing.T) {
+	resetTables(t)
+
+	if _, err := testDB.Exec(
+		`SELECT pgwf.submit_job($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+		defaultTenantID, "job-alt-archive", "submitter", "cap.primary.archive", pqStringArray(nil), nil, nil, nil, nil, "cap.alt.archive", 0,
+	); err != nil {
+		t.Fatalf("submit job-alt-archive: %v", err)
+	}
+
+	jobID, leaseID := leaseSingleJob(t, []string{"cap.alt.archive"})
+	if jobID != "job-alt-archive" {
+		t.Fatalf("expected job-alt-archive lease, got %s", jobID)
+	}
+
+	if _, err := testDB.Exec(`SELECT pgwf.complete_job($1, $2, $3, $4)`, defaultTenantID, jobID, leaseID, "worker-archive"); err != nil {
+		t.Fatalf("complete job-alt-archive: %v", err)
+	}
+
+	var altNeed sql.NullString
+	var altAfter sql.NullInt32
+	if err := testDB.QueryRow(
+		`SELECT alternate_next_need, alternate_after_seconds FROM pgwf.jobs_archive WHERE job_id = $1`,
+		jobID,
+	).Scan(&altNeed, &altAfter); err != nil {
+		t.Fatalf("query archive alternate fields: %v", err)
+	}
+	if !altNeed.Valid || altNeed.String != "cap.alt.archive" {
+		t.Fatalf("expected alternate_next_need cap.alt.archive, got %+v", altNeed)
+	}
+	if !altAfter.Valid || altAfter.Int32 != 0 {
+		t.Fatalf("expected alternate_after_seconds 0, got %+v", altAfter)
 	}
 }
 

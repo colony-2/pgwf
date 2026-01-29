@@ -12,6 +12,8 @@ CREATE TABLE IF NOT EXISTS pgwf.jobs (
     tenant_id TEXT NOT NULL,
     job_id TEXT NOT NULL,
     next_need TEXT NOT NULL,
+    alternate_next_need TEXT,
+    alternate_after_seconds INTEGER,
     wait_for TEXT[] NOT NULL DEFAULT '{}'::TEXT[],
     payload JSONB NOT NULL DEFAULT '{}'::JSONB,
     singleton_key TEXT,
@@ -27,7 +29,8 @@ CREATE TABLE IF NOT EXISTS pgwf.jobs (
     cancel_requested_at TIMESTAMPTZ,
     PRIMARY KEY (tenant_id, job_id),
     CONSTRAINT jobs_payload_is_object CHECK (jsonb_typeof(payload) = 'object'),
-    CONSTRAINT jobs_payload_size_limit CHECK (pg_column_size(payload) <= 512)
+    CONSTRAINT jobs_payload_size_limit CHECK (pg_column_size(payload) <= 512),
+    CONSTRAINT jobs_alternate_after_seconds_nonnegative CHECK (alternate_after_seconds IS NULL OR alternate_after_seconds >= 0)
 );
 
 CREATE TABLE IF NOT EXISTS pgwf.jobs_archive (
@@ -35,6 +38,8 @@ CREATE TABLE IF NOT EXISTS pgwf.jobs_archive (
     tenant_id TEXT NOT NULL,
     job_id TEXT NOT NULL,
     next_need TEXT NOT NULL,
+    alternate_next_need TEXT,
+    alternate_after_seconds INTEGER,
     wait_for TEXT[] NOT NULL DEFAULT '{}'::TEXT[],
     payload JSONB NOT NULL DEFAULT '{}'::JSONB,
     singleton_key TEXT,
@@ -48,7 +53,8 @@ CREATE TABLE IF NOT EXISTS pgwf.jobs_archive (
     cancel_requested_at TIMESTAMPTZ,
     PRIMARY KEY (tenant_id, job_id),
     CONSTRAINT jobs_archive_payload_is_object CHECK (jsonb_typeof(payload) = 'object'),
-    CONSTRAINT jobs_archive_payload_size_limit CHECK (pg_column_size(payload) <= 512)
+    CONSTRAINT jobs_archive_payload_size_limit CHECK (pg_column_size(payload) <= 512),
+    CONSTRAINT jobs_archive_alternate_after_seconds_nonnegative CHECK (alternate_after_seconds IS NULL OR alternate_after_seconds >= 0)
 );
 
 CREATE TABLE IF NOT EXISTS pgwf.jobs_trace (
@@ -108,34 +114,64 @@ END;
 $$;
 
 CREATE OR REPLACE VIEW pgwf.jobs_with_status AS
-SELECT
-    j.*,
-    CASE
-        WHEN j.lease_expires_at > clock_timestamp() THEN 'ACTIVE'
-        WHEN j.cancel_requested THEN 'CANCELLED'
-        WHEN j.available_at > clock_timestamp() THEN 'AWAITING_FUTURE'
-        WHEN EXISTS (
-            SELECT 1
-            FROM unnest(j.wait_for) AS dep_job_id
-            WHERE NOT EXISTS (
+WITH status_calc AS (
+    SELECT
+        j.*,
+        CASE
+            WHEN j.lease_expires_at > clock_timestamp() THEN 'ACTIVE'
+            WHEN j.cancel_requested THEN 'CANCELLED'
+            WHEN j.available_at > clock_timestamp() THEN 'AWAITING_FUTURE'
+            WHEN EXISTS (
                 SELECT 1
-                FROM pgwf.jobs_archive ja
-                WHERE ja.tenant_id = j.tenant_id
-                  AND ja.job_id = dep_job_id
+                FROM unnest(j.wait_for) AS dep_job_id
+                WHERE NOT EXISTS (
+                    SELECT 1
+                    FROM pgwf.jobs_archive ja
+                    WHERE ja.tenant_id = j.tenant_id
+                      AND ja.job_id = dep_job_id
+                )
+            ) THEN 'PENDING_JOBS'
+            WHEN j.consecutive_expirations >= pgwf.crash_concern_threshold() THEN 'CRASH_CONCERN'
+            WHEN j.expires_at <= clock_timestamp() THEN 'EXPIRED'
+            ELSE 'READY'
+        END AS status
+    FROM pgwf.jobs j
+),
+ready_calc AS (
+    SELECT
+        sc.*,
+        CASE
+            WHEN sc.status = 'READY' THEN GREATEST(
+                sc.available_at,
+                COALESCE(NULLIF(sc.lease_expires_at, '-infinity'), sc.created_at),
+                CASE WHEN COALESCE(array_length(sc.wait_for, 1), 0) = 0 THEN sc.created_at ELSE '-infinity' END
             )
-        ) THEN 'PENDING_JOBS'
-        WHEN j.consecutive_expirations >= pgwf.crash_concern_threshold() THEN 'CRASH_CONCERN'
-        WHEN j.expires_at <= clock_timestamp() THEN 'EXPIRED'
-        ELSE 'READY'
-    END AS status
-FROM pgwf.jobs j;
+        END AS ready_since
+    FROM status_calc sc
+)
+SELECT
+    rc.*,
+    CASE
+        WHEN rc.status = 'READY'
+             AND rc.alternate_next_need IS NOT NULL
+             AND rc.alternate_after_seconds IS NOT NULL
+             AND rc.ready_since IS NOT NULL
+             AND clock_timestamp() >= rc.ready_since + make_interval(secs => rc.alternate_after_seconds)
+            THEN rc.alternate_next_need
+        ELSE rc.next_need
+    END AS effective_next_need
+FROM ready_calc rc;
 
 CREATE OR REPLACE VIEW pgwf.jobs_friendly_status AS
 SELECT
     jws.tenant_id,
     jws.job_id,
     jws.status,
+    jws.effective_next_need,
+    jws.alternate_next_need,
+    jws.alternate_after_seconds,
     jws.created_at AS creation_dt,
+    jws.ready_since,
     CASE WHEN jws.status = 'PENDING_JOBS' THEN jws.wait_for ELSE NULL END AS pending_jobs,
     CASE WHEN jws.status = 'AWAITING_FUTURE' THEN jws.available_at ELSE NULL END AS sleep_until,
     CASE WHEN jws.status = 'ACTIVE' THEN jws.lease_id ELSE NULL END AS worker_id,
@@ -294,6 +330,8 @@ BEGIN
         tenant_id,
         job_id,
         next_need,
+        alternate_next_need,
+        alternate_after_seconds,
         wait_for,
         payload,
         singleton_key,
@@ -310,6 +348,8 @@ BEGIN
         p_locked_job.tenant_id,
         p_locked_job.job_id,
         p_locked_job.next_need,
+        p_locked_job.alternate_next_need,
+        p_locked_job.alternate_after_seconds,
         p_locked_job.wait_for,
         p_locked_job.payload,
         p_locked_job.singleton_key,
@@ -454,7 +494,10 @@ CREATE OR REPLACE FUNCTION pgwf._reschedule_locked_job(
     p_wait_for TEXT[] DEFAULT '{}'::TEXT[],
     p_available_at TIMESTAMPTZ DEFAULT clock_timestamp(),
     p_payload JSONB DEFAULT NULL,
-    p_trace_context JSONB DEFAULT '{}'::JSONB
+    p_trace_context JSONB DEFAULT '{}'::JSONB,
+    p_alternate_next_need TEXT DEFAULT NULL,
+    p_alternate_after_seconds INTEGER DEFAULT NULL,
+    p_set_alternate BOOLEAN DEFAULT FALSE
 )
 RETURNS TABLE(job_id TEXT, next_need TEXT, wait_for TEXT[], available_at TIMESTAMPTZ)
 LANGUAGE plpgsql
@@ -465,6 +508,8 @@ DECLARE
     v_expires_at TIMESTAMPTZ;
     v_now TIMESTAMPTZ := clock_timestamp();
     v_payload JSONB := COALESCE(p_payload, p_locked_job.payload);
+    v_alternate_next_need TEXT := p_locked_job.alternate_next_need;
+    v_alternate_after_seconds INTEGER := p_locked_job.alternate_after_seconds;
 BEGIN
     v_wait_for := pgwf.normalize_wait_for(p_locked_job.tenant_id, p_wait_for);
 
@@ -478,8 +523,18 @@ BEGIN
         END IF;
     END IF;
 
+    IF p_set_alternate OR p_alternate_next_need IS NOT NULL OR p_alternate_after_seconds IS NOT NULL THEN
+        IF p_alternate_after_seconds IS NOT NULL AND p_alternate_after_seconds < 0 THEN
+            RAISE EXCEPTION 'alternate_after_seconds must be non-negative';
+        END IF;
+        v_alternate_next_need := p_alternate_next_need;
+        v_alternate_after_seconds := p_alternate_after_seconds;
+    END IF;
+
     UPDATE pgwf.jobs j
     SET next_need = p_next_need,
+        alternate_next_need = v_alternate_next_need,
+        alternate_after_seconds = v_alternate_after_seconds,
         wait_for = v_wait_for,
         available_at = v_available_at,
         payload = v_payload,
@@ -515,14 +570,18 @@ BEGIN
             'next_need', p_next_need,
             'wait_for', v_wait_for,
             'available_at', v_available_at,
-            'expires_at', v_expires_at
+            'expires_at', v_expires_at,
+            'alternate_next_need', v_alternate_next_need,
+            'alternate_after_seconds', v_alternate_after_seconds
         ) || COALESCE(p_trace_context, '{}'::JSONB),
         jsonb_build_object(
             'job_id', job_id,
             'next_need', next_need,
             'wait_for', wait_for,
             'available_at', available_at,
-            'expires_at', v_expires_at
+            'expires_at', v_expires_at,
+            'alternate_next_need', v_alternate_next_need,
+            'alternate_after_seconds', v_alternate_after_seconds
         )
     );
 
@@ -575,7 +634,9 @@ CREATE OR REPLACE FUNCTION pgwf.submit_job(
     p_payload JSONB DEFAULT '{}'::JSONB,
     p_singleton_key TEXT DEFAULT NULL,
     p_available_at TIMESTAMPTZ DEFAULT clock_timestamp(),
-    p_expires_at TIMESTAMPTZ DEFAULT NULL
+    p_expires_at TIMESTAMPTZ DEFAULT NULL,
+    p_alternate_next_need TEXT DEFAULT NULL,
+    p_alternate_after_seconds INTEGER DEFAULT NULL
 )
 RETURNS TABLE(tenant_id TEXT, job_id TEXT, next_need TEXT, wait_for TEXT[], payload JSONB, available_at TIMESTAMPTZ)
 LANGUAGE plpgsql
@@ -606,8 +667,34 @@ BEGIN
         RAISE EXCEPTION 'payload exceeds 512 bytes';
     END IF;
 
-    INSERT INTO pgwf.jobs (tenant_id, job_id, next_need, wait_for, payload, singleton_key, available_at, expires_at)
-    VALUES (p_tenant_id, p_job_id, p_next_need, v_wait_for, v_payload, p_singleton_key, v_effective_available, v_expires_at)
+    IF p_alternate_after_seconds IS NOT NULL AND p_alternate_after_seconds < 0 THEN
+        RAISE EXCEPTION 'alternate_after_seconds must be non-negative';
+    END IF;
+
+    INSERT INTO pgwf.jobs (
+        tenant_id,
+        job_id,
+        next_need,
+        alternate_next_need,
+        alternate_after_seconds,
+        wait_for,
+        payload,
+        singleton_key,
+        available_at,
+        expires_at
+    )
+    VALUES (
+        p_tenant_id,
+        p_job_id,
+        p_next_need,
+        p_alternate_next_need,
+        p_alternate_after_seconds,
+        v_wait_for,
+        v_payload,
+        p_singleton_key,
+        v_effective_available,
+        v_expires_at
+    )
     RETURNING pgwf.jobs.tenant_id, pgwf.jobs.job_id, pgwf.jobs.next_need, pgwf.jobs.wait_for, pgwf.jobs.payload, pgwf.jobs.available_at, pgwf.jobs.cancel_requested
     INTO tenant_id, job_id, next_need, wait_for, payload, available_at, v_cancel_requested;
 
@@ -628,7 +715,9 @@ BEGIN
             'wait_for', v_wait_for,
             'singleton_key', p_singleton_key,
             'available_at', v_effective_available,
-            'expires_at', v_expires_at
+            'expires_at', v_expires_at,
+            'alternate_next_need', p_alternate_next_need,
+            'alternate_after_seconds', p_alternate_after_seconds
         ),
         jsonb_build_object(
             'tenant_id', tenant_id,
@@ -636,7 +725,9 @@ BEGIN
             'next_need', next_need,
             'wait_for', wait_for,
             'available_at', available_at,
-            'expires_at', v_expires_at
+            'expires_at', v_expires_at,
+            'alternate_next_need', p_alternate_next_need,
+            'alternate_after_seconds', p_alternate_after_seconds
         )
     );
 
@@ -757,6 +848,11 @@ DECLARE
     v_previous_lease_expired BOOLEAN;
     v_total_expirations BIGINT;
     v_consecutive_expirations BIGINT;
+    v_stored_next_need TEXT;
+    v_pivoted BOOLEAN;
+    v_alternate_next_need TEXT;
+    v_alternate_after_seconds INTEGER;
+    v_ready_since TIMESTAMPTZ;
 BEGIN
     IF v_caps IS NULL OR array_length(v_caps, 1) = 0 THEN
         RAISE EXCEPTION 'worker_caps cannot be empty';
@@ -774,13 +870,14 @@ BEGIN
 
     FOR v_tenant_id, job_id, lease_id, next_need, singleton_key, wait_for, payload, available_at, lease_expires_at,
         v_previous_lease_id, v_previous_lease_expires_at, v_previous_lease_expired,
-        v_total_expirations, v_consecutive_expirations IN
+        v_total_expirations, v_consecutive_expirations, v_stored_next_need, v_pivoted,
+        v_alternate_next_need, v_alternate_after_seconds, v_ready_since IN
         WITH candidates AS (
             SELECT jws.*,
                    (jws.lease_id IS NOT NULL AND jws.lease_expires_at <= v_now) AS lease_was_expired
             FROM pgwf.jobs_with_status jws
             WHERE jws.status = 'READY'
-              AND jws.next_need = ANY(v_caps)
+              AND jws.effective_next_need = ANY(v_caps)
               AND (p_tenant_ids IS NULL OR array_length(p_tenant_ids, 1) IS NULL OR jws.tenant_id = ANY(p_tenant_ids))
               AND (
                   jws.singleton_key IS NULL OR NOT EXISTS (
@@ -813,7 +910,7 @@ BEGIN
         RETURNING j.tenant_id,
                   j.job_id,
                   j.lease_id,
-                  j.next_need,
+                  c.effective_next_need,
                   j.singleton_key,
                   j.wait_for,
                   j.payload,
@@ -823,7 +920,12 @@ BEGIN
                   c.lease_expires_at AS previous_lease_expires_at,
                   c.lease_was_expired AS lease_previously_expired,
                   j.lease_expiration_count,
-                  j.consecutive_expirations
+                  j.consecutive_expirations,
+                  c.next_need AS stored_next_need,
+                  c.effective_next_need <> c.next_need AS pivoted_to_alternate,
+                  c.alternate_next_need,
+                  c.alternate_after_seconds,
+                  c.ready_since
     LOOP
 
         IF v_previous_lease_expired THEN
@@ -857,7 +959,13 @@ BEGIN
                 'worker_caps', v_caps,
                 'tenant_ids', p_tenant_ids,
                 'lease_seconds', p_lease_seconds,
-                'limit_jobs', p_limit_jobs
+                'limit_jobs', p_limit_jobs,
+                'stored_next_need', v_stored_next_need,
+                'effective_next_need', next_need,
+                'alternate_next_need', v_alternate_next_need,
+                'alternate_after_seconds', v_alternate_after_seconds,
+                'ready_since', v_ready_since,
+                'pivoted_to_alternate', v_pivoted
             ),
             jsonb_build_object(
                 'lease_id', lease_id,
@@ -947,7 +1055,10 @@ CREATE OR REPLACE FUNCTION pgwf.reschedule_job(
     p_next_need TEXT,
     p_wait_for TEXT[] DEFAULT '{}'::TEXT[],
     p_available_at TIMESTAMPTZ DEFAULT clock_timestamp(),
-    p_payload JSONB DEFAULT NULL
+    p_payload JSONB DEFAULT NULL,
+    p_alternate_next_need TEXT DEFAULT NULL,
+    p_alternate_after_seconds INTEGER DEFAULT NULL,
+    p_set_alternate BOOLEAN DEFAULT FALSE
 )
 RETURNS TABLE(job_id TEXT, next_need TEXT, wait_for TEXT[], available_at TIMESTAMPTZ)
 LANGUAGE plpgsql
@@ -977,7 +1088,10 @@ BEGIN
         p_wait_for,
         p_available_at,
         p_payload,
-        jsonb_build_object('lease_id', p_lease_id)
+        jsonb_build_object('lease_id', p_lease_id),
+        p_alternate_next_need,
+        p_alternate_after_seconds,
+        p_set_alternate
     );
 END;
 $$;
@@ -1143,6 +1257,8 @@ BEGIN
             tenant_id,
             job_id,
             next_need,
+            alternate_next_need,
+            alternate_after_seconds,
             wait_for,
             payload,
             singleton_key,
@@ -1159,6 +1275,8 @@ BEGIN
             j.tenant_id,
             j.job_id,
             j.next_need,
+            j.alternate_next_need,
+            j.alternate_after_seconds,
             j.wait_for,
             j.payload,
             j.singleton_key,
@@ -1259,7 +1377,10 @@ CREATE OR REPLACE FUNCTION pgwf.reschedule_unheld_job(
     p_next_need TEXT,
     p_wait_for TEXT[] DEFAULT '{}'::TEXT[],
     p_available_at TIMESTAMPTZ DEFAULT clock_timestamp(),
-    p_payload JSONB DEFAULT NULL
+    p_payload JSONB DEFAULT NULL,
+    p_alternate_next_need TEXT DEFAULT NULL,
+    p_alternate_after_seconds INTEGER DEFAULT NULL,
+    p_set_alternate BOOLEAN DEFAULT FALSE
 )
 RETURNS TABLE(job_id TEXT, next_need TEXT, wait_for TEXT[], available_at TIMESTAMPTZ)
 LANGUAGE plpgsql
@@ -1290,7 +1411,10 @@ BEGIN
         p_wait_for,
         p_available_at,
         p_payload,
-        jsonb_build_object('rescheduled_without_lease', TRUE)
+        jsonb_build_object('rescheduled_without_lease', TRUE),
+        p_alternate_next_need,
+        p_alternate_after_seconds,
+        p_set_alternate
     );
 END;
 $$;
