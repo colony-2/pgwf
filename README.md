@@ -1,6 +1,6 @@
 # pgwf
 
-pgwf (Postgres Workflow) is a pure-SQL workflow engine. It's built specifically to solve for reliable coordination of complex interconnected, long running jobs without dealing with arbitrarily large or complex internal job states. The pgwf workflow engine provides for durable job metadata, leasing, and traceability entirely inside PostgreSQL. Jobs may include a small JSON payload (object, ≤512 bytes) captured at creation and optionally updated when rescheduling to a new `next_need`; larger state should live in external systems. When paired with journal system, we can achieve complex distributed durable patterns with minimal infrastructure complexity or need for distributed transaction coordination.
+pgwf (Postgres Workflow) is a pure-SQL workflow engine. It's built specifically to solve for reliable coordination of complex interconnected, long running jobs without dealing with arbitrarily large or complex internal job states. The pgwf workflow engine provides for durable job metadata, leasing, and traceability entirely inside PostgreSQL. Jobs may include a small JSON payload (object, ≤512 bytes) captured at creation and optionally updated when rescheduling to a new `next_need`, plus optional immutable JSON metadata (object, ≤8192 bytes) set at submission time. Larger state should live in external systems. When paired with journal system, we can achieve complex distributed durable patterns with minimal infrastructure complexity or need for distributed transaction coordination.
 
 ## Core Objects
 
@@ -12,7 +12,7 @@ pgwf (Postgres Workflow) is a pure-SQL workflow engine. It's built specifically 
 
 | Function          | Description                                                                                                            | Signature                                                                                                                                   |
 |-------------------|------------------------------------------------------------------------------------------------------------------------|---------------------------------------------------------------------------------------------------------------------------------------------|
-| `submit_job` | Inserts a new job, validates dependencies, attaches an optional payload, and (optionally) emits notifications for `next_need`. | `submit_job(tenant_id TEXT, job_id TEXT, worker_id TEXT, next_need TEXT, wait_for TEXT[], payload JSONB, singleton_key TEXT, available_at TIMESTAMPTZ, expires_at TIMESTAMPTZ)` |
+| `submit_job` | Inserts a new job, validates dependencies, attaches an optional payload and metadata, and (optionally) emits notifications for `next_need`. | `submit_job(tenant_id TEXT, job_id TEXT, worker_id TEXT, next_need TEXT, wait_for TEXT[], payload JSONB, metadata JSONB, singleton_key TEXT, available_at TIMESTAMPTZ, expires_at TIMESTAMPTZ)` |
 | `get_work`        | Leases up to `limit_jobs` that match the supplied capabilities and optional tenant filter, assigning a fresh `lease_id` and visibility timeout.   | `get_work(worker_id TEXT, worker_caps TEXT[], tenant_ids TEXT[], lease_seconds INT, limit_jobs INT)`                                                           |
 | `extend_lease`    | Heartbeats an active lease by pushing `lease_expires_at` into the future.                                              | `extend_lease(tenant_id TEXT, job_id TEXT, lease_id TEXT, worker_id TEXT, additional_seconds INT)`                                                          |
 | `reschedule_job`  | Returns a leased job to the queue with updated capability/dependency metadata, optional payload override, and clears the lease. | `reschedule_job(tenant_id TEXT, job_id TEXT, lease_id TEXT, worker_id TEXT, next_need TEXT, wait_for TEXT[], available_at TIMESTAMPTZ, payload JSONB)` |
@@ -27,8 +27,8 @@ pgwf (Postgres Workflow) is a pure-SQL workflow engine. It's built specifically 
 
 | Table | Columns (summary) | Purpose |
 |-------|-------------------|---------|
-| `jobs` | `tenant_id`, `job_id`, `next_need`, `wait_for[]`, `payload`, `singleton_key`, `available_at`, `expires_at`, `lease_id`, `lease_expires_at`, `lease_expiration_count`, `consecutive_expirations`, timestamps, cancellation metadata | Live job metadata for runnable/leased/delayed jobs plus crash-concern counters. Primary key: `(tenant_id, job_id)`. |
-| `jobs_archive` | `tenant_id`, `job_id`, `next_need`, `wait_for[]`, `payload`, `singleton_key`, `created_at`, `expires_at`, `lease_id`, `lease_expiration_count`, `consecutive_expirations`, `archived_at`, cancellation metadata | Immutable snapshot for completed or cancelled jobs; prevents `job_id` reuse within same tenant. Primary key: `(tenant_id, job_id)`. |
+| `jobs` | `tenant_id`, `job_id`, `next_need`, `wait_for[]`, `payload`, `metadata`, `singleton_key`, `available_at`, `expires_at`, `lease_id`, `lease_expires_at`, `lease_expiration_count`, `consecutive_expirations`, timestamps, cancellation metadata | Live job metadata for runnable/leased/delayed jobs plus crash-concern counters. Primary key: `(tenant_id, job_id)`. |
+| `jobs_archive` | `tenant_id`, `job_id`, `next_need`, `wait_for[]`, `payload`, `metadata`, `singleton_key`, `created_at`, `expires_at`, `lease_id`, `lease_expiration_count`, `consecutive_expirations`, `archived_at`, cancellation metadata | Immutable snapshot for completed or cancelled jobs; prevents `job_id` reuse within same tenant. Primary key: `(tenant_id, job_id)`. |
 | `jobs_trace` | `trace_id`, `tenant_id`, `job_id`, `event_type`, `worker_id`, `event_at`, `input_data`, `output_data` | Append-only audit log of every workflow call, scoped per tenant. |
 
 ### Views
@@ -55,6 +55,13 @@ pgwf (Postgres Workflow) is a pure-SQL workflow engine. It's built specifically 
 - Optional JSONB object supplied at submission time; defaults to `{}`.
 - Must be an object and ≤512 bytes stored size (`pg_column_size`) in both `jobs` and `jobs_archive`.
 - Returned from `submit_job`, `get_work`, and surfaced in status views; intentionally excluded from trace rows.
+
+### Metadata
+
+- Optional JSONB object supplied at submission time; defaults to `{}`.
+- Must be an object and ≤8192 bytes stored size (`pg_column_size`) in both `jobs` and `jobs_archive`.
+- Immutable after submission; returned from `submit_job` and surfaced in `jobs_with_status`.
+- Intentionally excluded from trace rows.
 
 
 ## Inspiration
@@ -215,7 +222,7 @@ Every time `pgwf.get_work` picks up a job whose previous lease already expired, 
 - The journal owns payloads: inputs, intermediate artifacts, and outputs. Entries are never mutated and the journal only guarantees in-order durable consistency.
 - pgwf owns execution metadata: which capability needs are next, who currently holds the lease, and which dependencies remain.
 
-Because the two concerns are separate, you can replay or rehydrate workflows by reading the journal while pgwf keeps scheduling honest. pgwf never stores payload blobs. pgwf just stores pointer (`job_id`) back to the journal plus scheduling metadata.
+Because the two concerns are separate, you can replay or rehydrate workflows by reading the journal while pgwf keeps scheduling honest. pgwf never stores payload blobs. pgwf just stores pointer (`job_id`) back to the journal plus scheduling metadata, along with a small immutable `metadata` JSONB for job context.
 
 ## Inter-transaction Jobs
 
@@ -251,7 +258,7 @@ If the transaction commits, both the invoice row and the workflow job become dur
 ```
 
 1. **Producer writes payload** – The producer persists the workflow input in journal, receiving a deterministic `job_id`.
-2. **Submit metadata** – The producer calls `pgwf.submit_job(job_id, worker_id, next_need, wait_for, singleton_key, available_at)` to register the work. Example:
+2. **Submit job** – The producer calls `pgwf.submit_job(job_id, worker_id, next_need, wait_for, metadata, singleton_key, available_at)` to register the work. Example:
 
     ```sql
     SELECT tenant_id, job_id
@@ -261,6 +268,7 @@ If the transaction commits, both the invoice row and the workflow job become dur
         p_worker_id     => 'ingest-service',
         p_next_need     => 'transcode.video',
         p_wait_for      => ARRAY['preflight-99'],
+        p_metadata      => '{"source":"journal"}'::JSONB,
         p_singleton_key => 'video-777',
         p_available_at  => clock_timestamp()
     );

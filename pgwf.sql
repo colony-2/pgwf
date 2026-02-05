@@ -16,6 +16,7 @@ CREATE TABLE IF NOT EXISTS pgwf.jobs (
     alternate_after_seconds INTEGER,
     wait_for TEXT[] NOT NULL DEFAULT '{}'::TEXT[],
     payload JSONB NOT NULL DEFAULT '{}'::JSONB,
+    metadata JSONB NOT NULL DEFAULT '{}'::JSONB,
     singleton_key TEXT,
     available_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
     expires_at TIMESTAMPTZ NOT NULL DEFAULT 'infinity',
@@ -30,8 +31,51 @@ CREATE TABLE IF NOT EXISTS pgwf.jobs (
     PRIMARY KEY (tenant_id, job_id),
     CONSTRAINT jobs_payload_is_object CHECK (jsonb_typeof(payload) = 'object'),
     CONSTRAINT jobs_payload_size_limit CHECK (pg_column_size(payload) <= 512),
+    CONSTRAINT jobs_metadata_is_object CHECK (jsonb_typeof(metadata) = 'object'),
+    CONSTRAINT jobs_metadata_size_limit CHECK (pg_column_size(metadata) <= 8192),
     CONSTRAINT jobs_alternate_after_seconds_nonnegative CHECK (alternate_after_seconds IS NULL OR alternate_after_seconds >= 0)
 );
+
+ALTER TABLE pgwf.jobs
+ADD COLUMN IF NOT EXISTS metadata JSONB;
+
+ALTER TABLE pgwf.jobs
+ALTER COLUMN metadata SET DEFAULT '{}'::JSONB;
+
+UPDATE pgwf.jobs
+SET metadata = '{}'::JSONB
+WHERE metadata IS NULL;
+
+ALTER TABLE pgwf.jobs
+ALTER COLUMN metadata SET NOT NULL;
+
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1
+        FROM pg_constraint
+        WHERE conname = 'jobs_metadata_is_object'
+          AND conrelid = 'pgwf.jobs'::regclass
+    ) THEN
+        ALTER TABLE pgwf.jobs
+        ADD CONSTRAINT jobs_metadata_is_object CHECK (jsonb_typeof(metadata) = 'object');
+    END IF;
+END;
+$$;
+
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1
+        FROM pg_constraint
+        WHERE conname = 'jobs_metadata_size_limit'
+          AND conrelid = 'pgwf.jobs'::regclass
+    ) THEN
+        ALTER TABLE pgwf.jobs
+        ADD CONSTRAINT jobs_metadata_size_limit CHECK (pg_column_size(metadata) <= 8192);
+    END IF;
+END;
+$$;
 
 CREATE TABLE IF NOT EXISTS pgwf.jobs_archive (
     archived_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
@@ -42,6 +86,7 @@ CREATE TABLE IF NOT EXISTS pgwf.jobs_archive (
     alternate_after_seconds INTEGER,
     wait_for TEXT[] NOT NULL DEFAULT '{}'::TEXT[],
     payload JSONB NOT NULL DEFAULT '{}'::JSONB,
+    metadata JSONB NOT NULL DEFAULT '{}'::JSONB,
     singleton_key TEXT,
     created_at TIMESTAMPTZ NOT NULL,
     expires_at TIMESTAMPTZ NOT NULL DEFAULT 'infinity',
@@ -54,8 +99,51 @@ CREATE TABLE IF NOT EXISTS pgwf.jobs_archive (
     PRIMARY KEY (tenant_id, job_id),
     CONSTRAINT jobs_archive_payload_is_object CHECK (jsonb_typeof(payload) = 'object'),
     CONSTRAINT jobs_archive_payload_size_limit CHECK (pg_column_size(payload) <= 512),
+    CONSTRAINT jobs_archive_metadata_is_object CHECK (jsonb_typeof(metadata) = 'object'),
+    CONSTRAINT jobs_archive_metadata_size_limit CHECK (pg_column_size(metadata) <= 8192),
     CONSTRAINT jobs_archive_alternate_after_seconds_nonnegative CHECK (alternate_after_seconds IS NULL OR alternate_after_seconds >= 0)
 );
+
+ALTER TABLE pgwf.jobs_archive
+ADD COLUMN IF NOT EXISTS metadata JSONB;
+
+ALTER TABLE pgwf.jobs_archive
+ALTER COLUMN metadata SET DEFAULT '{}'::JSONB;
+
+UPDATE pgwf.jobs_archive
+SET metadata = '{}'::JSONB
+WHERE metadata IS NULL;
+
+ALTER TABLE pgwf.jobs_archive
+ALTER COLUMN metadata SET NOT NULL;
+
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1
+        FROM pg_constraint
+        WHERE conname = 'jobs_archive_metadata_is_object'
+          AND conrelid = 'pgwf.jobs_archive'::regclass
+    ) THEN
+        ALTER TABLE pgwf.jobs_archive
+        ADD CONSTRAINT jobs_archive_metadata_is_object CHECK (jsonb_typeof(metadata) = 'object');
+    END IF;
+END;
+$$;
+
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1
+        FROM pg_constraint
+        WHERE conname = 'jobs_archive_metadata_size_limit'
+          AND conrelid = 'pgwf.jobs_archive'::regclass
+    ) THEN
+        ALTER TABLE pgwf.jobs_archive
+        ADD CONSTRAINT jobs_archive_metadata_size_limit CHECK (pg_column_size(metadata) <= 8192);
+    END IF;
+END;
+$$;
 
 CREATE TABLE IF NOT EXISTS pgwf.jobs_trace (
     trace_id BIGINT PRIMARY KEY DEFAULT nextval('pgwf.jobs_trace_id_seq'),
@@ -81,9 +169,15 @@ CREATE INDEX IF NOT EXISTS idx_jobs_tenant_waitfor
 ON pgwf.jobs(tenant_id, job_id)
 INCLUDE (wait_for);
 
+CREATE INDEX IF NOT EXISTS idx_jobs_metadata_gin
+ON pgwf.jobs USING GIN (metadata);
+
 CREATE INDEX IF NOT EXISTS idx_jobs_tenant_cancelled
 ON pgwf.jobs(tenant_id, created_at)
 WHERE cancel_requested = TRUE;
+
+CREATE INDEX IF NOT EXISTS idx_jobs_archive_metadata_gin
+ON pgwf.jobs_archive USING GIN (metadata);
 
 CREATE INDEX IF NOT EXISTS idx_trace_tenant_job_event
 ON pgwf.jobs_trace(tenant_id, job_id, event_at DESC);
@@ -334,6 +428,7 @@ BEGIN
         alternate_after_seconds,
         wait_for,
         payload,
+        metadata,
         singleton_key,
         created_at,
         expires_at,
@@ -352,6 +447,7 @@ BEGIN
         p_locked_job.alternate_after_seconds,
         p_locked_job.wait_for,
         p_locked_job.payload,
+        p_locked_job.metadata,
         p_locked_job.singleton_key,
         p_locked_job.created_at,
         p_locked_job.expires_at,
@@ -480,7 +576,7 @@ BEGIN
             'job_id', p_locked_job.job_id,
             'worker_id', p_worker_id
         ) || COALESCE(p_trace_context, '{}'::JSONB),
-        jsonb_build_object('archived_row', to_jsonb(v_archive) - 'payload')
+        jsonb_build_object('archived_row', to_jsonb(v_archive) - 'payload' - 'metadata')
     );
 
     RETURN TRUE;
@@ -632,13 +728,14 @@ CREATE OR REPLACE FUNCTION pgwf.submit_job(
     p_next_need TEXT,
     p_wait_for TEXT[] DEFAULT '{}'::TEXT[],
     p_payload JSONB DEFAULT '{}'::JSONB,
+    p_metadata JSONB DEFAULT '{}'::JSONB,
     p_singleton_key TEXT DEFAULT NULL,
     p_available_at TIMESTAMPTZ DEFAULT clock_timestamp(),
     p_expires_at TIMESTAMPTZ DEFAULT NULL,
     p_alternate_next_need TEXT DEFAULT NULL,
     p_alternate_after_seconds INTEGER DEFAULT NULL
 )
-RETURNS TABLE(tenant_id TEXT, job_id TEXT, next_need TEXT, wait_for TEXT[], payload JSONB, available_at TIMESTAMPTZ)
+RETURNS TABLE(tenant_id TEXT, job_id TEXT, next_need TEXT, wait_for TEXT[], payload JSONB, metadata JSONB, available_at TIMESTAMPTZ)
 LANGUAGE plpgsql
 AS $$
 DECLARE
@@ -648,6 +745,7 @@ DECLARE
     v_cancel_requested BOOLEAN;
     v_now TIMESTAMPTZ := clock_timestamp();
     v_payload JSONB := COALESCE(p_payload, '{}'::JSONB);
+    v_metadata JSONB := COALESCE(p_metadata, '{}'::JSONB);
 BEGIN
     IF p_tenant_id IS NULL THEN
         RAISE EXCEPTION 'tenant_id cannot be NULL';
@@ -667,6 +765,14 @@ BEGIN
         RAISE EXCEPTION 'payload exceeds 512 bytes';
     END IF;
 
+    IF jsonb_typeof(v_metadata) IS DISTINCT FROM 'object' THEN
+        RAISE EXCEPTION 'metadata must be a JSON object';
+    END IF;
+
+    IF pg_column_size(v_metadata) > 8192 THEN
+        RAISE EXCEPTION 'metadata exceeds 8192 bytes';
+    END IF;
+
     IF p_alternate_after_seconds IS NOT NULL AND p_alternate_after_seconds < 0 THEN
         RAISE EXCEPTION 'alternate_after_seconds must be non-negative';
     END IF;
@@ -679,6 +785,7 @@ BEGIN
         alternate_after_seconds,
         wait_for,
         payload,
+        metadata,
         singleton_key,
         available_at,
         expires_at
@@ -691,12 +798,20 @@ BEGIN
         p_alternate_after_seconds,
         v_wait_for,
         v_payload,
+        v_metadata,
         p_singleton_key,
         v_effective_available,
         v_expires_at
     )
-    RETURNING pgwf.jobs.tenant_id, pgwf.jobs.job_id, pgwf.jobs.next_need, pgwf.jobs.wait_for, pgwf.jobs.payload, pgwf.jobs.available_at, pgwf.jobs.cancel_requested
-    INTO tenant_id, job_id, next_need, wait_for, payload, available_at, v_cancel_requested;
+    RETURNING pgwf.jobs.tenant_id,
+              pgwf.jobs.job_id,
+              pgwf.jobs.next_need,
+              pgwf.jobs.wait_for,
+              pgwf.jobs.payload,
+              pgwf.jobs.metadata,
+              pgwf.jobs.available_at,
+              pgwf.jobs.cancel_requested
+    INTO tenant_id, job_id, next_need, wait_for, payload, metadata, available_at, v_cancel_requested;
 
     IF NOT v_cancel_requested AND v_expires_at > v_now THEN
         PERFORM pgwf._notify_need(next_need, job_id);
@@ -1261,6 +1376,7 @@ BEGIN
             alternate_after_seconds,
             wait_for,
             payload,
+            metadata,
             singleton_key,
             created_at,
             expires_at,
@@ -1279,6 +1395,7 @@ BEGIN
             j.alternate_after_seconds,
             j.wait_for,
             j.payload,
+            j.metadata,
             j.singleton_key,
             j.created_at,
             j.expires_at,
@@ -1312,7 +1429,7 @@ BEGIN
                 'worker_id', p_worker_id,
                 'cancel_requested_at', a.cancel_requested_at
             ),
-            jsonb_build_object('archived_row', to_jsonb(a) - 'payload')
+            jsonb_build_object('archived_row', to_jsonb(a) - 'payload' - 'metadata')
         FROM archived a
         WHERE v_trace_enabled
     ),
