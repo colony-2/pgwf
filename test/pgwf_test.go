@@ -910,18 +910,18 @@ func TestCompletionArchivesJob(t *testing.T) {
 	}
 
 	var completionStatus sql.NullString
-	var failureDetail sql.NullString
+	var completionDetail sql.NullString
 	if err := testDB.QueryRow(
-		`SELECT completion_status, failure_detail FROM pgwf.jobs_archive WHERE tenant_id = $1 AND job_id = $2`,
+		`SELECT completion_status, completion_detail FROM pgwf.jobs_archive WHERE tenant_id = $1 AND job_id = $2`,
 		defaultTenantID, jobID,
-	).Scan(&completionStatus, &failureDetail); err != nil {
+	).Scan(&completionStatus, &completionDetail); err != nil {
 		t.Fatalf("query completion fields: %v", err)
 	}
 	if completionStatus.String != "succeeded" {
 		t.Fatalf("expected completion_status succeeded, got %s", completionStatus.String)
 	}
-	if failureDetail.Valid {
-		t.Fatalf("expected failure_detail to be NULL, got %s", failureDetail.String)
+	if completionDetail.Valid {
+		t.Fatalf("expected completion_detail to be NULL, got %s", completionDetail.String)
 	}
 
 	var remaining int
@@ -947,7 +947,7 @@ func TestCompletionArchivesJob(t *testing.T) {
 	expectErrorContains(t, err, "already completed")
 }
 
-func TestCompletionFailureDetail(t *testing.T) {
+func TestCompletionDetail(t *testing.T) {
 	resetTables(t)
 
 	if _, err := testDB.Exec(`SELECT pgwf.submit_job($1, $2, $3, $4)`, defaultTenantID, "job-failed", "submitter", "cap.fail"); err != nil {
@@ -967,18 +967,18 @@ func TestCompletionFailureDetail(t *testing.T) {
 	}
 
 	var completionStatus string
-	var failureDetail string
+	var completionDetail string
 	if err := testDB.QueryRow(
-		`SELECT completion_status, failure_detail FROM pgwf.jobs_archive WHERE tenant_id = $1 AND job_id = $2`,
+		`SELECT completion_status, completion_detail FROM pgwf.jobs_archive WHERE tenant_id = $1 AND job_id = $2`,
 		defaultTenantID, jobID,
-	).Scan(&completionStatus, &failureDetail); err != nil {
+	).Scan(&completionStatus, &completionDetail); err != nil {
 		t.Fatalf("query archive: %v", err)
 	}
 	if completionStatus != "failed" {
 		t.Fatalf("expected completion_status failed, got %s", completionStatus)
 	}
-	if failureDetail != "boom" {
-		t.Fatalf("expected failure_detail boom, got %s", failureDetail)
+	if completionDetail != "boom" {
+		t.Fatalf("expected completion_detail boom, got %s", completionDetail)
 	}
 
 	if _, err := testDB.Exec(`SELECT pgwf.submit_job($1, $2, $3, $4)`, defaultTenantID, "job-invalid-detail", "submitter", "cap.fail"); err != nil {
@@ -986,22 +986,28 @@ func TestCompletionFailureDetail(t *testing.T) {
 	}
 	jobID, leaseID = leaseSingleJob(t, []string{"cap.fail"})
 
-	_, err := testDB.Exec(
+	if err := testDB.QueryRow(
 		`SELECT pgwf.complete_job($1, $2, $3, $4, $5, $6)`,
-		defaultTenantID, jobID, leaseID, "worker", "succeeded", "not-allowed",
-	)
-	expectErrorContains(t, err, "failure_detail is only allowed when completion_status is failed")
-
-	if _, err := testDB.Exec(`SELECT pgwf.submit_job($1, $2, $3, $4)`, defaultTenantID, "job-invalid-status", "submitter", "cap.fail"); err != nil {
-		t.Fatalf("submit invalid status: %v", err)
+		defaultTenantID, jobID, leaseID, "worker", "custom", "detail-ok",
+	).Scan(&ok); err != nil {
+		t.Fatalf("complete_job custom: %v", err)
 	}
-	jobID, leaseID = leaseSingleJob(t, []string{"cap.fail"})
+	if !ok {
+		t.Fatalf("complete_job custom returned false")
+	}
 
-	_, err = testDB.Exec(
-		`SELECT pgwf.complete_job($1, $2, $3, $4, $5)`,
-		defaultTenantID, jobID, leaseID, "worker", "cancelled",
-	)
-	expectErrorContains(t, err, "completion_status must be succeeded or failed")
+	if err := testDB.QueryRow(
+		`SELECT completion_status, completion_detail FROM pgwf.jobs_archive WHERE tenant_id = $1 AND job_id = $2`,
+		defaultTenantID, jobID,
+	).Scan(&completionStatus, &completionDetail); err != nil {
+		t.Fatalf("query custom archive: %v", err)
+	}
+	if completionStatus != "custom" {
+		t.Fatalf("expected completion_status custom, got %s", completionStatus)
+	}
+	if completionDetail != "detail-ok" {
+		t.Fatalf("expected completion_detail detail-ok, got %s", completionDetail)
+	}
 }
 
 func TestArchiveCancelledJobs(t *testing.T) {
