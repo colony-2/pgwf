@@ -96,6 +96,8 @@ CREATE TABLE IF NOT EXISTS pgwf.jobs_archive (
     cancel_requested BOOLEAN NOT NULL DEFAULT FALSE,
     cancel_requested_by TEXT,
     cancel_requested_at TIMESTAMPTZ,
+    completion_status TEXT NOT NULL DEFAULT 'succeeded',
+    failure_detail TEXT,
     PRIMARY KEY (tenant_id, job_id),
     CONSTRAINT jobs_archive_payload_is_object CHECK (jsonb_typeof(payload) = 'object'),
     CONSTRAINT jobs_archive_payload_size_limit CHECK (pg_column_size(payload) <= 512),
@@ -116,6 +118,25 @@ WHERE metadata IS NULL;
 
 ALTER TABLE pgwf.jobs_archive
 ALTER COLUMN metadata SET NOT NULL;
+
+ALTER TABLE pgwf.jobs_archive
+ADD COLUMN IF NOT EXISTS completion_status TEXT;
+
+ALTER TABLE pgwf.jobs_archive
+ALTER COLUMN completion_status SET DEFAULT 'succeeded';
+
+UPDATE pgwf.jobs_archive
+SET completion_status = CASE
+    WHEN cancel_requested THEN 'cancelled'
+    ELSE 'succeeded'
+END
+WHERE completion_status IS NULL;
+
+ALTER TABLE pgwf.jobs_archive
+ALTER COLUMN completion_status SET NOT NULL;
+
+ALTER TABLE pgwf.jobs_archive
+ADD COLUMN IF NOT EXISTS failure_detail TEXT;
 
 DO $$
 BEGIN
@@ -141,6 +162,36 @@ BEGIN
     ) THEN
         ALTER TABLE pgwf.jobs_archive
         ADD CONSTRAINT jobs_archive_metadata_size_limit CHECK (pg_column_size(metadata) <= 8192);
+    END IF;
+END;
+$$;
+
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1
+        FROM pg_constraint
+        WHERE conname = 'jobs_archive_completion_status_valid'
+          AND conrelid = 'pgwf.jobs_archive'::regclass
+    ) THEN
+        ALTER TABLE pgwf.jobs_archive
+        ADD CONSTRAINT jobs_archive_completion_status_valid
+        CHECK (completion_status IN ('succeeded', 'failed', 'cancelled'));
+    END IF;
+END;
+$$;
+
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1
+        FROM pg_constraint
+        WHERE conname = 'jobs_archive_failure_detail_requires_failed'
+          AND conrelid = 'pgwf.jobs_archive'::regclass
+    ) THEN
+        ALTER TABLE pgwf.jobs_archive
+        ADD CONSTRAINT jobs_archive_failure_detail_requires_failed
+        CHECK (failure_detail IS NULL OR completion_status = 'failed');
     END IF;
 END;
 $$;
@@ -412,7 +463,9 @@ END;
 $$;
 
 CREATE OR REPLACE FUNCTION pgwf._archive_and_delete_job(
-    p_locked_job pgwf.jobs_with_status
+    p_locked_job pgwf.jobs_with_status,
+    p_completion_status TEXT,
+    p_failure_detail TEXT
 )
 RETURNS pgwf.jobs_archive
 LANGUAGE plpgsql
@@ -437,7 +490,9 @@ BEGIN
         consecutive_expirations,
         cancel_requested,
         cancel_requested_by,
-        cancel_requested_at
+        cancel_requested_at,
+        completion_status,
+        failure_detail
     )
     VALUES (
         p_locked_job.tenant_id,
@@ -456,7 +511,9 @@ BEGIN
         p_locked_job.consecutive_expirations,
         p_locked_job.cancel_requested,
         p_locked_job.cancel_requested_by,
-        p_locked_job.cancel_requested_at
+        p_locked_job.cancel_requested_at,
+        p_completion_status,
+        p_failure_detail
     )
     RETURNING * INTO v_archive;
 
@@ -553,6 +610,8 @@ $$;
 CREATE OR REPLACE FUNCTION pgwf._complete_locked_job(
     p_locked_job pgwf.jobs_with_status,
     p_worker_id TEXT,
+    p_completion_status TEXT,
+    p_failure_detail TEXT,
     p_trace_context JSONB DEFAULT '{}'::JSONB
 )
 RETURNS BOOLEAN
@@ -561,8 +620,19 @@ AS $$
 DECLARE
     v_archive pgwf.jobs_archive%ROWTYPE;
 BEGIN
+    IF p_completion_status IS NULL OR p_completion_status NOT IN ('succeeded', 'failed') THEN
+        RAISE EXCEPTION 'completion_status must be succeeded or failed';
+    END IF;
+    IF p_failure_detail IS NOT NULL AND p_completion_status <> 'failed' THEN
+        RAISE EXCEPTION 'failure_detail is only allowed when completion_status is failed';
+    END IF;
+
     p_locked_job.consecutive_expirations := 0;
-    v_archive := pgwf._archive_and_delete_job(p_locked_job);
+    v_archive := pgwf._archive_and_delete_job(
+        p_locked_job,
+        p_completion_status,
+        p_failure_detail
+    );
 
     PERFORM pgwf._update_waiters_for_completion(p_locked_job.tenant_id, p_locked_job.job_id);
 
@@ -1215,7 +1285,9 @@ CREATE OR REPLACE FUNCTION pgwf.complete_job(
     p_tenant_id TEXT,
     p_job_id TEXT,
     p_lease_id TEXT,
-    p_worker_id TEXT
+    p_worker_id TEXT,
+    p_completion_status TEXT DEFAULT 'succeeded',
+    p_failure_detail TEXT DEFAULT NULL
 )
 RETURNS BOOLEAN
 LANGUAGE plpgsql
@@ -1234,6 +1306,8 @@ BEGIN
     RETURN pgwf._complete_locked_job(
         v_job,
         p_worker_id,
+        p_completion_status,
+        p_failure_detail,
         jsonb_build_object('lease_id', p_lease_id)
     );
 END;
@@ -1242,7 +1316,9 @@ $$;
 CREATE OR REPLACE FUNCTION pgwf.complete_unheld_job(
     p_tenant_id TEXT,
     p_job_id TEXT,
-    p_worker_id TEXT
+    p_worker_id TEXT,
+    p_completion_status TEXT DEFAULT 'succeeded',
+    p_failure_detail TEXT DEFAULT NULL
 )
 RETURNS BOOLEAN
 LANGUAGE plpgsql
@@ -1263,6 +1339,8 @@ BEGIN
     RETURN pgwf._complete_locked_job(
         v_job,
         p_worker_id,
+        p_completion_status,
+        p_failure_detail,
         jsonb_build_object('completed_without_lease', TRUE)
     );
 END;
@@ -1385,7 +1463,9 @@ BEGIN
             consecutive_expirations,
             cancel_requested,
             cancel_requested_by,
-            cancel_requested_at
+            cancel_requested_at,
+            completion_status,
+            failure_detail
         )
         SELECT
             j.tenant_id,
@@ -1404,7 +1484,9 @@ BEGIN
             j.consecutive_expirations,
             j.cancel_requested,
             j.cancel_requested_by,
-            j.cancel_requested_at
+            j.cancel_requested_at,
+            'cancelled',
+            NULL
         FROM pgwf.jobs j
         INNER JOIN candidates c ON j.tenant_id = c.tenant_id AND j.job_id = c.job_id
         RETURNING *

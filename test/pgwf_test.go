@@ -909,6 +909,21 @@ func TestCompletionArchivesJob(t *testing.T) {
 		t.Fatalf("expected archived row, got %d", archivedCount)
 	}
 
+	var completionStatus sql.NullString
+	var failureDetail sql.NullString
+	if err := testDB.QueryRow(
+		`SELECT completion_status, failure_detail FROM pgwf.jobs_archive WHERE tenant_id = $1 AND job_id = $2`,
+		defaultTenantID, jobID,
+	).Scan(&completionStatus, &failureDetail); err != nil {
+		t.Fatalf("query completion fields: %v", err)
+	}
+	if completionStatus.String != "succeeded" {
+		t.Fatalf("expected completion_status succeeded, got %s", completionStatus.String)
+	}
+	if failureDetail.Valid {
+		t.Fatalf("expected failure_detail to be NULL, got %s", failureDetail.String)
+	}
+
 	var remaining int
 	if err := testDB.QueryRow(`SELECT count(*) FROM pgwf.jobs`).Scan(&remaining); err != nil {
 		t.Fatalf("count jobs: %v", err)
@@ -930,6 +945,63 @@ func TestCompletionArchivesJob(t *testing.T) {
 		t.Fatalf("expected resubmission of archived job to fail")
 	}
 	expectErrorContains(t, err, "already completed")
+}
+
+func TestCompletionFailureDetail(t *testing.T) {
+	resetTables(t)
+
+	if _, err := testDB.Exec(`SELECT pgwf.submit_job($1, $2, $3, $4)`, defaultTenantID, "job-failed", "submitter", "cap.fail"); err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+	jobID, leaseID := leaseSingleJob(t, []string{"cap.fail"})
+
+	var ok bool
+	if err := testDB.QueryRow(
+		`SELECT pgwf.complete_job($1, $2, $3, $4, $5, $6)`,
+		defaultTenantID, jobID, leaseID, "worker", "failed", "boom",
+	).Scan(&ok); err != nil {
+		t.Fatalf("complete_job failed: %v", err)
+	}
+	if !ok {
+		t.Fatalf("complete_job returned false")
+	}
+
+	var completionStatus string
+	var failureDetail string
+	if err := testDB.QueryRow(
+		`SELECT completion_status, failure_detail FROM pgwf.jobs_archive WHERE tenant_id = $1 AND job_id = $2`,
+		defaultTenantID, jobID,
+	).Scan(&completionStatus, &failureDetail); err != nil {
+		t.Fatalf("query archive: %v", err)
+	}
+	if completionStatus != "failed" {
+		t.Fatalf("expected completion_status failed, got %s", completionStatus)
+	}
+	if failureDetail != "boom" {
+		t.Fatalf("expected failure_detail boom, got %s", failureDetail)
+	}
+
+	if _, err := testDB.Exec(`SELECT pgwf.submit_job($1, $2, $3, $4)`, defaultTenantID, "job-invalid-detail", "submitter", "cap.fail"); err != nil {
+		t.Fatalf("submit invalid detail: %v", err)
+	}
+	jobID, leaseID = leaseSingleJob(t, []string{"cap.fail"})
+
+	_, err := testDB.Exec(
+		`SELECT pgwf.complete_job($1, $2, $3, $4, $5, $6)`,
+		defaultTenantID, jobID, leaseID, "worker", "succeeded", "not-allowed",
+	)
+	expectErrorContains(t, err, "failure_detail is only allowed when completion_status is failed")
+
+	if _, err := testDB.Exec(`SELECT pgwf.submit_job($1, $2, $3, $4)`, defaultTenantID, "job-invalid-status", "submitter", "cap.fail"); err != nil {
+		t.Fatalf("submit invalid status: %v", err)
+	}
+	jobID, leaseID = leaseSingleJob(t, []string{"cap.fail"})
+
+	_, err = testDB.Exec(
+		`SELECT pgwf.complete_job($1, $2, $3, $4, $5)`,
+		defaultTenantID, jobID, leaseID, "worker", "cancelled",
+	)
+	expectErrorContains(t, err, "completion_status must be succeeded or failed")
 }
 
 func TestArchiveCancelledJobs(t *testing.T) {
@@ -974,6 +1046,17 @@ func TestArchiveCancelledJobs(t *testing.T) {
 	}
 	if cancelledArchiveRows != 2 {
 		t.Fatalf("expected archived rows to record cancellation, got %d", cancelledArchiveRows)
+	}
+
+	var cancelledStatusRows int
+	if err := testDB.QueryRow(
+		`SELECT count(*) FROM pgwf.jobs_archive WHERE tenant_id = $1 AND job_id = ANY($2) AND completion_status = 'cancelled'`,
+		defaultTenantID, pqStringArray([]string{"cancel-1", "cancel-2"}),
+	).Scan(&cancelledStatusRows); err != nil {
+		t.Fatalf("count cancelled status rows: %v", err)
+	}
+	if cancelledStatusRows != 2 {
+		t.Fatalf("expected archived rows to record completion_status cancelled, got %d", cancelledStatusRows)
 	}
 
 	var depWait pqStringArray
