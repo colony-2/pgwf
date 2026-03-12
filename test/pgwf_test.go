@@ -422,6 +422,215 @@ func TestMetadataValidation(t *testing.T) {
 	})
 }
 
+func TestGetWorkMetadataFilters(t *testing.T) {
+	resetTables(t)
+
+	t.Run("empty filter array preserves current behavior", func(t *testing.T) {
+		resetTables(t)
+
+		if _, err := testDB.Exec(
+			`SELECT pgwf.submit_job($1, $2, $3, $4, $5, $6, $7)`,
+			defaultTenantID, "job-no-filter", "submitter", "cap.meta.filter", pqStringArray(nil), nil, `{"source":"api"}`,
+		); err != nil {
+			t.Fatalf("submit_job: %v", err)
+		}
+
+		var tenantID, jobID string
+		if err := testDB.QueryRow(
+			`SELECT tenant_id, job_id FROM pgwf.get_work($1, $2, $3, $4, $5, $6, $7, $8)`,
+			"worker-meta", pqStringArray([]string{"cap.meta.filter"}), nil, 30, 1,
+			pqStringArray([]string{}), pqStringArray([]string{}), pqStringArray([]string{}),
+		).Scan(&tenantID, &jobID); err != nil {
+			t.Fatalf("get_work: %v", err)
+		}
+		if jobID != "job-no-filter" {
+			t.Fatalf("expected job-no-filter, got %s", jobID)
+		}
+	})
+
+	t.Run("equals filters by metadata path", func(t *testing.T) {
+		resetTables(t)
+
+		if _, err := testDB.Exec(
+			`SELECT pgwf.submit_job($1, $2, $3, $4, $5, $6, $7)`,
+			defaultTenantID, "job-batch", "submitter", "cap.meta.filter", pqStringArray(nil), nil, `{"source":"batch"}`,
+		); err != nil {
+			t.Fatalf("submit job-batch: %v", err)
+		}
+		if _, err := testDB.Exec(
+			`SELECT pgwf.submit_job($1, $2, $3, $4, $5, $6, $7)`,
+			defaultTenantID, "job-api", "submitter", "cap.meta.filter", pqStringArray(nil), nil, `{"source":"api"}`,
+		); err != nil {
+			t.Fatalf("submit job-api: %v", err)
+		}
+
+		var tenantID, jobID string
+		if err := testDB.QueryRow(
+			`SELECT tenant_id, job_id FROM pgwf.get_work($1, $2, $3, $4, $5, $6, $7, $8)`,
+			"worker-meta", pqStringArray([]string{"cap.meta.filter"}), nil, 30, 1,
+			pqStringArray([]string{"{source}"}),
+			pqStringArray([]string{"equals"}),
+			pqStringArray([]string{"{api}"}),
+		).Scan(&tenantID, &jobID); err != nil {
+			t.Fatalf("get_work: %v", err)
+		}
+		if jobID != "job-api" {
+			t.Fatalf("expected job-api, got %s", jobID)
+		}
+	})
+
+	t.Run("array_any uses OR within values and AND across predicates", func(t *testing.T) {
+		resetTables(t)
+
+		if _, err := testDB.Exec(
+			`SELECT pgwf.submit_job($1, $2, $3, $4, $5, $6, $7)`,
+			defaultTenantID, "job-nonmatch", "submitter", "cap.meta.filter", pqStringArray(nil), nil,
+			`{"source":"api","routing":{"labels":["region:eu","priority:high"]}}`,
+		); err != nil {
+			t.Fatalf("submit job-nonmatch: %v", err)
+		}
+		if _, err := testDB.Exec(
+			`SELECT pgwf.submit_job($1, $2, $3, $4, $5, $6, $7)`,
+			defaultTenantID, "job-match", "submitter", "cap.meta.filter", pqStringArray(nil), nil,
+			`{"source":"scheduler","routing":{"labels":["region:us","priority:low"]}}`,
+		); err != nil {
+			t.Fatalf("submit job-match: %v", err)
+		}
+
+		var tenantID, jobID string
+		if err := testDB.QueryRow(
+			`SELECT tenant_id, job_id FROM pgwf.get_work($1, $2, $3, $4, $5, $6, $7, $8)`,
+			"worker-meta", pqStringArray([]string{"cap.meta.filter"}), nil, 30, 1,
+			pqStringArray([]string{"{source}", "{routing,labels}"}),
+			pqStringArray([]string{"equals", "array_any"}),
+			pqStringArray([]string{"{api,scheduler}", "{region:ca,region:us}"}),
+		).Scan(&tenantID, &jobID); err != nil {
+			t.Fatalf("get_work: %v", err)
+		}
+		if jobID != "job-match" {
+			t.Fatalf("expected job-match, got %s", jobID)
+		}
+	})
+
+	t.Run("array_any ignores missing and non-array paths", func(t *testing.T) {
+		resetTables(t)
+
+		if _, err := testDB.Exec(
+			`SELECT pgwf.submit_job($1, $2, $3, $4, $5, $6, $7)`,
+			defaultTenantID, "job-scalar", "submitter", "cap.meta.filter", pqStringArray(nil), nil,
+			`{"routing":{"labels":"region:us"}}`,
+		); err != nil {
+			t.Fatalf("submit job-scalar: %v", err)
+		}
+		if _, err := testDB.Exec(
+			`SELECT pgwf.submit_job($1, $2, $3, $4, $5, $6, $7)`,
+			defaultTenantID, "job-missing", "submitter", "cap.meta.filter", pqStringArray(nil), nil,
+			`{"source":"api"}`,
+		); err != nil {
+			t.Fatalf("submit job-missing: %v", err)
+		}
+
+		rows, err := testDB.Query(
+			`SELECT tenant_id, job_id FROM pgwf.get_work($1, $2, $3, $4, $5, $6, $7, $8)`,
+			"worker-meta", pqStringArray([]string{"cap.meta.filter"}), nil, 30, 1,
+			pqStringArray([]string{"{routing,labels}"}),
+			pqStringArray([]string{"array_any"}),
+			pqStringArray([]string{"{region:us}"}),
+		)
+		if err != nil {
+			t.Fatalf("get_work: %v", err)
+		}
+		defer rows.Close()
+		if rows.Next() {
+			var tenantID, jobID string
+			if err := rows.Scan(&tenantID, &jobID); err != nil {
+				t.Fatalf("scan: %v", err)
+			}
+			t.Fatalf("expected no matching work, got %s", jobID)
+		}
+		if err := rows.Err(); err != nil {
+			t.Fatalf("rows err: %v", err)
+		}
+	})
+
+	t.Run("malformed filters fail clearly", func(t *testing.T) {
+		resetTables(t)
+
+		if _, err := testDB.Exec(
+			`SELECT pgwf.submit_job($1, $2, $3, $4)`,
+			defaultTenantID, "job-malformed", "submitter", "cap.meta.filter",
+		); err != nil {
+			t.Fatalf("submit_job: %v", err)
+		}
+
+		testCases := []struct {
+			name   string
+			paths  []string
+			ops    []string
+			values []string
+			msg    string
+		}{
+			{
+				name:   "mismatched lengths",
+				paths:  []string{"{source}"},
+				ops:    []string{},
+				values: []string{"{api}"},
+				msg:    "metadata filter paths, ops, and values must have matching lengths",
+			},
+			{
+				name:   "invalid path literal",
+				paths:  []string{"not-array"},
+				ops:    []string{"equals"},
+				values: []string{"{api}"},
+				msg:    "metadata filter path must be a valid text[] literal",
+			},
+			{
+				name:   "empty path",
+				paths:  []string{"{}"},
+				ops:    []string{"equals"},
+				values: []string{"{api}"},
+				msg:    "metadata filter path must be a non-empty array",
+			},
+			{
+				name:   "unknown op",
+				paths:  []string{"{source}"},
+				ops:    []string{"weird"},
+				values: []string{"{api}"},
+				msg:    "unsupported metadata filter op",
+			},
+			{
+				name:   "invalid values literal",
+				paths:  []string{"{routing,labels}"},
+				ops:    []string{"array_any"},
+				values: []string{"not-array"},
+				msg:    "metadata filter values must be a valid text[] literal",
+			},
+			{
+				name:   "empty values",
+				paths:  []string{"{routing,labels}"},
+				ops:    []string{"array_any"},
+				values: []string{"{}"},
+				msg:    "metadata filter values must be a non-empty array",
+			},
+		}
+
+		for _, tc := range testCases {
+			t.Run(tc.name, func(t *testing.T) {
+				rows, err := testDB.Query(
+					`SELECT tenant_id, job_id FROM pgwf.get_work($1, $2, $3, $4, $5, $6, $7, $8)`,
+					"worker-meta", pqStringArray([]string{"cap.meta.filter"}), nil, 30, 1,
+					pqStringArray(tc.paths), pqStringArray(tc.ops), pqStringArray(tc.values),
+				)
+				if err == nil {
+					rows.Close()
+					t.Fatalf("expected get_work to fail")
+				}
+				expectErrorContains(t, err, tc.msg)
+			})
+		}
+	})
+}
+
 func TestPayloadRescheduleUpdates(t *testing.T) {
 	resetTables(t)
 

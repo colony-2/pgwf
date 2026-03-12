@@ -1022,12 +1022,89 @@ BEGIN
 END;
 $$;
 
+CREATE OR REPLACE FUNCTION pgwf.validate_metadata_filters(
+    p_metadata_filter_paths TEXT[],
+    p_metadata_filter_ops TEXT[],
+    p_metadata_filter_values TEXT[]
+)
+RETURNS VOID
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_count INTEGER;
+    v_idx INTEGER;
+    v_path TEXT[];
+    v_values TEXT[];
+    v_op TEXT;
+BEGIN
+    IF p_metadata_filter_paths IS NULL AND p_metadata_filter_ops IS NULL AND p_metadata_filter_values IS NULL THEN
+        RETURN;
+    END IF;
+
+    IF p_metadata_filter_paths IS NULL OR p_metadata_filter_ops IS NULL OR p_metadata_filter_values IS NULL THEN
+        RAISE EXCEPTION 'metadata filter paths, ops, and values must all be provided together';
+    END IF;
+
+    v_count := COALESCE(array_length(p_metadata_filter_paths, 1), 0);
+    IF v_count = 0 THEN
+        IF COALESCE(array_length(p_metadata_filter_ops, 1), 0) <> 0 OR COALESCE(array_length(p_metadata_filter_values, 1), 0) <> 0 THEN
+            RAISE EXCEPTION 'metadata filter paths, ops, and values must have matching lengths';
+        END IF;
+        RETURN;
+    END IF;
+
+    IF COALESCE(array_length(p_metadata_filter_ops, 1), 0) <> v_count OR COALESCE(array_length(p_metadata_filter_values, 1), 0) <> v_count THEN
+        RAISE EXCEPTION 'metadata filter paths, ops, and values must have matching lengths';
+    END IF;
+
+    FOR v_idx IN 1..v_count LOOP
+        BEGIN
+            v_path := p_metadata_filter_paths[v_idx]::TEXT[];
+        EXCEPTION
+            WHEN others THEN
+                RAISE EXCEPTION 'metadata filter path must be a valid text[] literal';
+        END;
+
+        IF COALESCE(array_length(v_path, 1), 0) = 0 THEN
+            RAISE EXCEPTION 'metadata filter path must be a non-empty array';
+        END IF;
+
+        IF EXISTS (
+            SELECT 1
+            FROM unnest(v_path) AS elem(value)
+            WHERE elem.value IS NULL OR elem.value = ''
+        ) THEN
+            RAISE EXCEPTION 'metadata filter path elements must be non-empty strings';
+        END IF;
+
+        BEGIN
+            v_values := p_metadata_filter_values[v_idx]::TEXT[];
+        EXCEPTION
+            WHEN others THEN
+                RAISE EXCEPTION 'metadata filter values must be a valid text[] literal';
+        END;
+
+        IF COALESCE(array_length(v_values, 1), 0) = 0 THEN
+            RAISE EXCEPTION 'metadata filter values must be a non-empty array';
+        END IF;
+
+        v_op := COALESCE(p_metadata_filter_ops[v_idx], 'equals');
+        IF v_op NOT IN ('equals', 'array_any') THEN
+            RAISE EXCEPTION 'unsupported metadata filter op: %', v_op;
+        END IF;
+    END LOOP;
+END;
+$$;
+
 CREATE OR REPLACE FUNCTION pgwf.get_work(
     p_worker_id TEXT,
     p_worker_caps TEXT[],
     p_tenant_ids TEXT[] DEFAULT NULL,
     p_lease_seconds INTEGER DEFAULT 60,
-    p_limit_jobs INTEGER DEFAULT 1
+    p_limit_jobs INTEGER DEFAULT 1,
+    p_metadata_filter_paths TEXT[] DEFAULT NULL,
+    p_metadata_filter_ops TEXT[] DEFAULT NULL,
+    p_metadata_filter_values TEXT[] DEFAULT NULL
 )
 RETURNS TABLE(
     tenant_id TEXT,
@@ -1059,6 +1136,12 @@ DECLARE
     v_alternate_next_need TEXT;
     v_alternate_after_seconds INTEGER;
     v_ready_since TIMESTAMPTZ;
+    v_sql TEXT;
+    v_filter_count INTEGER;
+    v_filter_idx INTEGER;
+    v_filter_path TEXT[];
+    v_filter_values TEXT[];
+    v_filter_op TEXT;
 BEGIN
     IF v_caps IS NULL OR array_length(v_caps, 1) = 0 THEN
         RAISE EXCEPTION 'worker_caps cannot be empty';
@@ -1072,19 +1155,47 @@ BEGIN
         RAISE EXCEPTION 'limit_jobs must be positive';
     END IF;
 
+    PERFORM pgwf.validate_metadata_filters(
+        p_metadata_filter_paths,
+        p_metadata_filter_ops,
+        p_metadata_filter_values
+    );
+
     v_expires := v_now + make_interval(secs => p_lease_seconds);
 
-    FOR v_tenant_id, job_id, lease_id, next_need, singleton_key, wait_for, payload, available_at, lease_expires_at,
-        v_previous_lease_id, v_previous_lease_expires_at, v_previous_lease_expired,
-        v_total_expirations, v_consecutive_expirations, v_stored_next_need, v_pivoted,
-        v_alternate_next_need, v_alternate_after_seconds, v_ready_since IN
+    v_sql := $sql$
         WITH candidates AS (
             SELECT jws.*,
-                   (jws.lease_id IS NOT NULL AND jws.lease_expires_at <= v_now) AS lease_was_expired
+                   (jws.lease_id IS NOT NULL AND jws.lease_expires_at <= $1) AS lease_was_expired
             FROM pgwf.jobs_with_status jws
             WHERE jws.status = 'READY'
-              AND jws.effective_next_need = ANY(v_caps)
-              AND (p_tenant_ids IS NULL OR array_length(p_tenant_ids, 1) IS NULL OR jws.tenant_id = ANY(p_tenant_ids))
+              AND jws.effective_next_need = ANY($2)
+              AND ($3 IS NULL OR array_length($3, 1) IS NULL OR jws.tenant_id = ANY($3))
+    $sql$;
+
+    v_filter_count := COALESCE(array_length(p_metadata_filter_paths, 1), 0);
+    FOR v_filter_idx IN 1..v_filter_count LOOP
+        v_filter_path := p_metadata_filter_paths[v_filter_idx]::TEXT[];
+        v_filter_values := p_metadata_filter_values[v_filter_idx]::TEXT[];
+        v_filter_op := COALESCE(p_metadata_filter_ops[v_filter_idx], 'equals');
+
+        IF v_filter_op = 'equals' THEN
+            v_sql := v_sql || format(
+                ' AND (jws.metadata #>> %L::text[]) = ANY(%L::text[])',
+                v_filter_path,
+                v_filter_values
+            );
+        ELSIF v_filter_op = 'array_any' THEN
+            v_sql := v_sql || format(
+                ' AND jsonb_typeof(jws.metadata #> %L::text[]) = ''array'' AND (jws.metadata #> %L::text[]) ?| %L::text[]',
+                v_filter_path,
+                v_filter_path,
+                v_filter_values
+            );
+        END IF;
+    END LOOP;
+
+    v_sql := v_sql || $sql$
               AND (
                   jws.singleton_key IS NULL OR NOT EXISTS (
                       SELECT 1
@@ -1095,7 +1206,7 @@ BEGIN
                   )
               )
             ORDER BY jws.created_at ASC
-            LIMIT p_limit_jobs
+            LIMIT $4
             FOR UPDATE SKIP LOCKED
         )
         UPDATE pgwf.jobs j
@@ -1109,7 +1220,7 @@ BEGIN
                 ELSE j.consecutive_expirations
             END,
             lease_id = gen_random_uuid()::TEXT,
-            lease_expires_at = v_expires
+            lease_expires_at = $5
         FROM candidates c
         WHERE j.tenant_id = c.tenant_id
           AND j.job_id = c.job_id
@@ -1132,6 +1243,14 @@ BEGIN
                   c.alternate_next_need,
                   c.alternate_after_seconds,
                   c.ready_since
+    $sql$;
+
+    FOR v_tenant_id, job_id, lease_id, next_need, singleton_key, wait_for, payload, available_at, lease_expires_at,
+        v_previous_lease_id, v_previous_lease_expires_at, v_previous_lease_expired,
+        v_total_expirations, v_consecutive_expirations, v_stored_next_need, v_pivoted,
+        v_alternate_next_need, v_alternate_after_seconds, v_ready_since IN
+        EXECUTE v_sql
+        USING v_now, v_caps, p_tenant_ids, p_limit_jobs, v_expires
     LOOP
 
         IF v_previous_lease_expired THEN
