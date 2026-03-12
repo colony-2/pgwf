@@ -437,9 +437,9 @@ func TestGetWorkMetadataFilters(t *testing.T) {
 
 		var tenantID, jobID string
 		if err := testDB.QueryRow(
-			`SELECT tenant_id, job_id FROM pgwf.get_work($1, $2, $3, $4, $5, $6, $7, $8)`,
+			`SELECT tenant_id, job_id FROM pgwf.get_work($1, $2, $3, $4, $5, $6, $7)`,
 			"worker-meta", pqStringArray([]string{"cap.meta.filter"}), nil, 30, 1,
-			pqStringArray([]string{}), pqStringArray([]string{}), pqStringArray([]string{}),
+			pqStringArray([]string{}), pqStringArray([]string{}),
 		).Scan(&tenantID, &jobID); err != nil {
 			t.Fatalf("get_work: %v", err)
 		}
@@ -466,10 +466,9 @@ func TestGetWorkMetadataFilters(t *testing.T) {
 
 		var tenantID, jobID string
 		if err := testDB.QueryRow(
-			`SELECT tenant_id, job_id FROM pgwf.get_work($1, $2, $3, $4, $5, $6, $7, $8)`,
+			`SELECT tenant_id, job_id FROM pgwf.get_work($1, $2, $3, $4, $5, $6, $7)`,
 			"worker-meta", pqStringArray([]string{"cap.meta.filter"}), nil, 30, 1,
 			pqStringArray([]string{"{source}"}),
-			pqStringArray([]string{"equals"}),
 			pqStringArray([]string{"{api}"}),
 		).Scan(&tenantID, &jobID); err != nil {
 			t.Fatalf("get_work: %v", err)
@@ -479,31 +478,30 @@ func TestGetWorkMetadataFilters(t *testing.T) {
 		}
 	})
 
-	t.Run("array_any uses OR within values and AND across predicates", func(t *testing.T) {
+	t.Run("multiple values use OR and multiple predicates use AND", func(t *testing.T) {
 		resetTables(t)
 
 		if _, err := testDB.Exec(
 			`SELECT pgwf.submit_job($1, $2, $3, $4, $5, $6, $7)`,
 			defaultTenantID, "job-nonmatch", "submitter", "cap.meta.filter", pqStringArray(nil), nil,
-			`{"source":"api","routing":{"labels":["region:eu","priority:high"]}}`,
+			`{"source":"api","priority":"high"}`,
 		); err != nil {
 			t.Fatalf("submit job-nonmatch: %v", err)
 		}
 		if _, err := testDB.Exec(
 			`SELECT pgwf.submit_job($1, $2, $3, $4, $5, $6, $7)`,
 			defaultTenantID, "job-match", "submitter", "cap.meta.filter", pqStringArray(nil), nil,
-			`{"source":"scheduler","routing":{"labels":["region:us","priority:low"]}}`,
+			`{"source":"scheduler","priority":"low"}`,
 		); err != nil {
 			t.Fatalf("submit job-match: %v", err)
 		}
 
 		var tenantID, jobID string
 		if err := testDB.QueryRow(
-			`SELECT tenant_id, job_id FROM pgwf.get_work($1, $2, $3, $4, $5, $6, $7, $8)`,
+			`SELECT tenant_id, job_id FROM pgwf.get_work($1, $2, $3, $4, $5, $6, $7)`,
 			"worker-meta", pqStringArray([]string{"cap.meta.filter"}), nil, 30, 1,
-			pqStringArray([]string{"{source}", "{routing,labels}"}),
-			pqStringArray([]string{"equals", "array_any"}),
-			pqStringArray([]string{"{api,scheduler}", "{region:ca,region:us}"}),
+			pqStringArray([]string{"{source}", "{priority}"}),
+			pqStringArray([]string{"{api,scheduler}", "{low}"}),
 		).Scan(&tenantID, &jobID); err != nil {
 			t.Fatalf("get_work: %v", err)
 		}
@@ -512,13 +510,13 @@ func TestGetWorkMetadataFilters(t *testing.T) {
 		}
 	})
 
-	t.Run("array_any ignores missing and non-array paths", func(t *testing.T) {
+	t.Run("missing and non-scalar paths do not match", func(t *testing.T) {
 		resetTables(t)
 
 		if _, err := testDB.Exec(
 			`SELECT pgwf.submit_job($1, $2, $3, $4, $5, $6, $7)`,
 			defaultTenantID, "job-scalar", "submitter", "cap.meta.filter", pqStringArray(nil), nil,
-			`{"routing":{"labels":"region:us"}}`,
+			`{"routing":{"labels":["region:us"]}}`,
 		); err != nil {
 			t.Fatalf("submit job-scalar: %v", err)
 		}
@@ -531,10 +529,9 @@ func TestGetWorkMetadataFilters(t *testing.T) {
 		}
 
 		rows, err := testDB.Query(
-			`SELECT tenant_id, job_id FROM pgwf.get_work($1, $2, $3, $4, $5, $6, $7, $8)`,
+			`SELECT tenant_id, job_id FROM pgwf.get_work($1, $2, $3, $4, $5, $6, $7)`,
 			"worker-meta", pqStringArray([]string{"cap.meta.filter"}), nil, 30, 1,
 			pqStringArray([]string{"{routing,labels}"}),
-			pqStringArray([]string{"array_any"}),
 			pqStringArray([]string{"{region:us}"}),
 		)
 		if err != nil {
@@ -566,49 +563,42 @@ func TestGetWorkMetadataFilters(t *testing.T) {
 		testCases := []struct {
 			name   string
 			paths  []string
-			ops    []string
 			values []string
 			msg    string
 		}{
 			{
 				name:   "mismatched lengths",
 				paths:  []string{"{source}"},
-				ops:    []string{},
-				values: []string{"{api}"},
-				msg:    "metadata filter paths, ops, and values must have matching lengths",
+				values: []string{},
+				msg:    "metadata filter paths and values must have matching lengths",
+			},
+			{
+				name:   "missing values array",
+				paths:  []string{"{source}"},
+				values: nil,
+				msg:    "metadata filter paths and values must all be provided together",
 			},
 			{
 				name:   "invalid path literal",
 				paths:  []string{"not-array"},
-				ops:    []string{"equals"},
 				values: []string{"{api}"},
 				msg:    "metadata filter path must be a valid text[] literal",
 			},
 			{
 				name:   "empty path",
 				paths:  []string{"{}"},
-				ops:    []string{"equals"},
 				values: []string{"{api}"},
 				msg:    "metadata filter path must be a non-empty array",
 			},
 			{
-				name:   "unknown op",
-				paths:  []string{"{source}"},
-				ops:    []string{"weird"},
-				values: []string{"{api}"},
-				msg:    "unsupported metadata filter op",
-			},
-			{
 				name:   "invalid values literal",
 				paths:  []string{"{routing,labels}"},
-				ops:    []string{"array_any"},
 				values: []string{"not-array"},
 				msg:    "metadata filter values must be a valid text[] literal",
 			},
 			{
 				name:   "empty values",
 				paths:  []string{"{routing,labels}"},
-				ops:    []string{"array_any"},
 				values: []string{"{}"},
 				msg:    "metadata filter values must be a non-empty array",
 			},
@@ -617,9 +607,9 @@ func TestGetWorkMetadataFilters(t *testing.T) {
 		for _, tc := range testCases {
 			t.Run(tc.name, func(t *testing.T) {
 				rows, err := testDB.Query(
-					`SELECT tenant_id, job_id FROM pgwf.get_work($1, $2, $3, $4, $5, $6, $7, $8)`,
+					`SELECT tenant_id, job_id FROM pgwf.get_work($1, $2, $3, $4, $5, $6, $7)`,
 					"worker-meta", pqStringArray([]string{"cap.meta.filter"}), nil, 30, 1,
-					pqStringArray(tc.paths), pqStringArray(tc.ops), pqStringArray(tc.values),
+					pqStringArray(tc.paths), pqStringArray(tc.values),
 				)
 				if err == nil {
 					rows.Close()

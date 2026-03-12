@@ -1024,7 +1024,6 @@ $$;
 
 CREATE OR REPLACE FUNCTION pgwf.validate_metadata_filters(
     p_metadata_filter_paths TEXT[],
-    p_metadata_filter_ops TEXT[],
     p_metadata_filter_values TEXT[]
 )
 RETURNS VOID
@@ -1035,26 +1034,25 @@ DECLARE
     v_idx INTEGER;
     v_path TEXT[];
     v_values TEXT[];
-    v_op TEXT;
 BEGIN
-    IF p_metadata_filter_paths IS NULL AND p_metadata_filter_ops IS NULL AND p_metadata_filter_values IS NULL THEN
+    IF p_metadata_filter_paths IS NULL AND p_metadata_filter_values IS NULL THEN
         RETURN;
     END IF;
 
-    IF p_metadata_filter_paths IS NULL OR p_metadata_filter_ops IS NULL OR p_metadata_filter_values IS NULL THEN
-        RAISE EXCEPTION 'metadata filter paths, ops, and values must all be provided together';
+    IF p_metadata_filter_paths IS NULL OR p_metadata_filter_values IS NULL THEN
+        RAISE EXCEPTION 'metadata filter paths and values must all be provided together';
     END IF;
 
     v_count := COALESCE(array_length(p_metadata_filter_paths, 1), 0);
     IF v_count = 0 THEN
-        IF COALESCE(array_length(p_metadata_filter_ops, 1), 0) <> 0 OR COALESCE(array_length(p_metadata_filter_values, 1), 0) <> 0 THEN
-            RAISE EXCEPTION 'metadata filter paths, ops, and values must have matching lengths';
+        IF COALESCE(array_length(p_metadata_filter_values, 1), 0) <> 0 THEN
+            RAISE EXCEPTION 'metadata filter paths and values must have matching lengths';
         END IF;
         RETURN;
     END IF;
 
-    IF COALESCE(array_length(p_metadata_filter_ops, 1), 0) <> v_count OR COALESCE(array_length(p_metadata_filter_values, 1), 0) <> v_count THEN
-        RAISE EXCEPTION 'metadata filter paths, ops, and values must have matching lengths';
+    IF COALESCE(array_length(p_metadata_filter_values, 1), 0) <> v_count THEN
+        RAISE EXCEPTION 'metadata filter paths and values must have matching lengths';
     END IF;
 
     FOR v_idx IN 1..v_count LOOP
@@ -1087,11 +1085,6 @@ BEGIN
         IF COALESCE(array_length(v_values, 1), 0) = 0 THEN
             RAISE EXCEPTION 'metadata filter values must be a non-empty array';
         END IF;
-
-        v_op := COALESCE(p_metadata_filter_ops[v_idx], 'equals');
-        IF v_op NOT IN ('equals', 'array_any') THEN
-            RAISE EXCEPTION 'unsupported metadata filter op: %', v_op;
-        END IF;
     END LOOP;
 END;
 $$;
@@ -1103,7 +1096,6 @@ CREATE OR REPLACE FUNCTION pgwf.get_work(
     p_lease_seconds INTEGER DEFAULT 60,
     p_limit_jobs INTEGER DEFAULT 1,
     p_metadata_filter_paths TEXT[] DEFAULT NULL,
-    p_metadata_filter_ops TEXT[] DEFAULT NULL,
     p_metadata_filter_values TEXT[] DEFAULT NULL
 )
 RETURNS TABLE(
@@ -1141,7 +1133,6 @@ DECLARE
     v_filter_idx INTEGER;
     v_filter_path TEXT[];
     v_filter_values TEXT[];
-    v_filter_op TEXT;
 BEGIN
     IF v_caps IS NULL OR array_length(v_caps, 1) = 0 THEN
         RAISE EXCEPTION 'worker_caps cannot be empty';
@@ -1157,7 +1148,6 @@ BEGIN
 
     PERFORM pgwf.validate_metadata_filters(
         p_metadata_filter_paths,
-        p_metadata_filter_ops,
         p_metadata_filter_values
     );
 
@@ -1177,22 +1167,11 @@ BEGIN
     FOR v_filter_idx IN 1..v_filter_count LOOP
         v_filter_path := p_metadata_filter_paths[v_filter_idx]::TEXT[];
         v_filter_values := p_metadata_filter_values[v_filter_idx]::TEXT[];
-        v_filter_op := COALESCE(p_metadata_filter_ops[v_filter_idx], 'equals');
-
-        IF v_filter_op = 'equals' THEN
-            v_sql := v_sql || format(
-                ' AND (jws.metadata #>> %L::text[]) = ANY(%L::text[])',
-                v_filter_path,
-                v_filter_values
-            );
-        ELSIF v_filter_op = 'array_any' THEN
-            v_sql := v_sql || format(
-                ' AND jsonb_typeof(jws.metadata #> %L::text[]) = ''array'' AND (jws.metadata #> %L::text[]) ?| %L::text[]',
-                v_filter_path,
-                v_filter_path,
-                v_filter_values
-            );
-        END IF;
+        v_sql := v_sql || format(
+            ' AND (jws.metadata #>> %L::text[]) = ANY(%L::text[])',
+            v_filter_path,
+            v_filter_values
+        );
     END LOOP;
 
     v_sql := v_sql || $sql$
