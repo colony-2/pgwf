@@ -1290,6 +1290,171 @@ BEGIN
 END;
 $$;
 
+CREATE OR REPLACE FUNCTION pgwf.get_job_lease(
+    p_tenant_id TEXT,
+    p_job_id TEXT,
+    p_worker_id TEXT,
+    p_worker_caps TEXT[],
+    p_lease_seconds INTEGER DEFAULT 60
+)
+RETURNS TABLE(
+    tenant_id TEXT,
+    job_id TEXT,
+    lease_id TEXT,
+    next_need TEXT,
+    singleton_key TEXT,
+    wait_for TEXT[],
+    payload JSONB,
+    available_at TIMESTAMPTZ,
+    lease_expires_at TIMESTAMPTZ
+)
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_caps TEXT[] := p_worker_caps;
+    v_now TIMESTAMPTZ := clock_timestamp();
+    v_expires TIMESTAMPTZ;
+    v_tenant_id TEXT;
+    v_previous_lease_id TEXT;
+    v_previous_lease_expires_at TIMESTAMPTZ;
+    v_previous_lease_expired BOOLEAN;
+    v_total_expirations BIGINT;
+    v_consecutive_expirations BIGINT;
+    v_stored_next_need TEXT;
+    v_pivoted BOOLEAN;
+    v_alternate_next_need TEXT;
+    v_alternate_after_seconds INTEGER;
+    v_ready_since TIMESTAMPTZ;
+BEGIN
+    IF p_tenant_id IS NULL THEN
+        RAISE EXCEPTION 'tenant_id cannot be NULL';
+    END IF;
+
+    IF p_job_id IS NULL THEN
+        RAISE EXCEPTION 'job_id cannot be NULL';
+    END IF;
+
+    IF p_worker_id IS NULL THEN
+        RAISE EXCEPTION 'worker_id cannot be NULL';
+    END IF;
+
+    IF v_caps IS NULL OR array_length(v_caps, 1) = 0 THEN
+        RAISE EXCEPTION 'worker_caps cannot be empty';
+    END IF;
+
+    IF p_lease_seconds IS NULL OR p_lease_seconds <= 0 THEN
+        RAISE EXCEPTION 'lease_seconds must be positive';
+    END IF;
+
+    v_expires := v_now + make_interval(secs => p_lease_seconds);
+
+    FOR v_tenant_id, job_id, lease_id, next_need, singleton_key, wait_for, payload, available_at, lease_expires_at,
+        v_previous_lease_id, v_previous_lease_expires_at, v_previous_lease_expired,
+        v_total_expirations, v_consecutive_expirations, v_stored_next_need, v_pivoted,
+        v_alternate_next_need, v_alternate_after_seconds, v_ready_since IN
+        WITH candidate AS (
+            SELECT jws.*,
+                   (jws.lease_id IS NOT NULL AND jws.lease_expires_at <= v_now) AS lease_was_expired
+            FROM pgwf.jobs_with_status jws
+            WHERE jws.tenant_id = p_tenant_id
+              AND jws.job_id = p_job_id
+              AND jws.status = 'READY'
+              AND jws.effective_next_need = ANY(v_caps)
+              AND (
+                  jws.singleton_key IS NULL OR NOT EXISTS (
+                      SELECT 1
+                      FROM pgwf.jobs_with_status other
+                      WHERE other.tenant_id = jws.tenant_id
+                        AND other.singleton_key = jws.singleton_key
+                        AND other.status = 'ACTIVE'
+                  )
+              )
+            FOR UPDATE SKIP LOCKED
+        )
+        UPDATE pgwf.jobs j
+        SET
+            lease_expiration_count = CASE
+                WHEN c.lease_was_expired THEN j.lease_expiration_count + 1
+                ELSE j.lease_expiration_count
+            END,
+            consecutive_expirations = CASE
+                WHEN c.lease_was_expired THEN j.consecutive_expirations + 1
+                ELSE j.consecutive_expirations
+            END,
+            lease_id = gen_random_uuid()::TEXT,
+            lease_expires_at = v_expires
+        FROM candidate c
+        WHERE j.tenant_id = c.tenant_id
+          AND j.job_id = c.job_id
+        RETURNING j.tenant_id,
+                  j.job_id,
+                  j.lease_id,
+                  c.effective_next_need,
+                  j.singleton_key,
+                  j.wait_for,
+                  j.payload,
+                  j.available_at,
+                  j.lease_expires_at,
+                  c.lease_id AS previous_lease_id,
+                  c.lease_expires_at AS previous_lease_expires_at,
+                  c.lease_was_expired AS lease_previously_expired,
+                  j.lease_expiration_count,
+                  j.consecutive_expirations,
+                  c.next_need AS stored_next_need,
+                  c.effective_next_need <> c.next_need AS pivoted_to_alternate,
+                  c.alternate_next_need,
+                  c.alternate_after_seconds,
+                  c.ready_since
+    LOOP
+        IF v_previous_lease_expired THEN
+            PERFORM pgwf._emit_trace_event(
+                v_tenant_id,
+                job_id,
+                'lease_expiration_counter_incremented',
+                p_worker_id,
+                jsonb_build_object(
+                    'tenant_id', v_tenant_id,
+                    'worker_id', p_worker_id,
+                    'worker_caps', v_caps,
+                    'previous_lease_id', v_previous_lease_id,
+                    'previous_lease_expires_at', v_previous_lease_expires_at,
+                    'lease_expiration_count', v_total_expirations,
+                    'consecutive_expirations', v_consecutive_expirations
+                )
+            );
+        END IF;
+
+        PERFORM pgwf._emit_trace_event(
+            v_tenant_id,
+            job_id,
+            'job_retrieved',
+            p_worker_id,
+            jsonb_build_object(
+                'tenant_id', v_tenant_id,
+                'job_id', job_id,
+                'worker_id', p_worker_id,
+                'worker_caps', v_caps,
+                'lease_seconds', p_lease_seconds,
+                'retrieval_mode', 'direct_job_id',
+                'stored_next_need', v_stored_next_need,
+                'effective_next_need', next_need,
+                'alternate_next_need', v_alternate_next_need,
+                'alternate_after_seconds', v_alternate_after_seconds,
+                'ready_since', v_ready_since,
+                'pivoted_to_alternate', v_pivoted
+            ),
+            jsonb_build_object(
+                'lease_id', lease_id,
+                'lease_expires_at', lease_expires_at
+            )
+        );
+
+        tenant_id := v_tenant_id;
+        RETURN NEXT;
+    END LOOP;
+END;
+$$;
+
 CREATE OR REPLACE FUNCTION pgwf.extend_lease(
     p_tenant_id TEXT,
     p_job_id TEXT,

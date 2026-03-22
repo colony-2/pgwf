@@ -621,6 +621,212 @@ func TestGetWorkMetadataFilters(t *testing.T) {
 	})
 }
 
+func TestGetJobLeaseTargetsSpecificJob(t *testing.T) {
+	resetTables(t)
+
+	for _, jobID := range []string{"job-older", "job-target"} {
+		if _, err := testDB.Exec(
+			`SELECT pgwf.submit_job($1, $2, $3, $4)`,
+			defaultTenantID, jobID, "submitter", "cap.direct",
+		); err != nil {
+			t.Fatalf("submit %s: %v", jobID, err)
+		}
+	}
+
+	var tenantID, jobID, leaseID string
+	if err := testDB.QueryRow(
+		`SELECT tenant_id, job_id, lease_id FROM pgwf.get_job_lease($1, $2, $3, $4, $5)`,
+		defaultTenantID, "job-target", "worker-direct", pqStringArray([]string{"cap.direct"}), 30,
+	).Scan(&tenantID, &jobID, &leaseID); err != nil {
+		t.Fatalf("get_job_lease: %v", err)
+	}
+	if tenantID != defaultTenantID {
+		t.Fatalf("expected tenant %s, got %s", defaultTenantID, tenantID)
+	}
+	if jobID != "job-target" {
+		t.Fatalf("expected job-target, got %s", jobID)
+	}
+	if leaseID == "" {
+		t.Fatalf("expected lease id")
+	}
+
+	if hasRow(t, `SELECT 1 FROM pgwf.jobs WHERE tenant_id = $1 AND job_id = $2 AND lease_id IS NOT NULL`, defaultTenantID, "job-older") {
+		t.Fatalf("job-older should remain unleased")
+	}
+
+	var nextJobID string
+	if err := testDB.QueryRow(
+		`SELECT job_id FROM pgwf.get_work($1, $2, $3, $4, $5)`,
+		"worker-next", pqStringArray([]string{"cap.direct"}), nil, 30, 1,
+	).Scan(&nextJobID); err != nil {
+		t.Fatalf("get_work: %v", err)
+	}
+	if nextJobID != "job-older" {
+		t.Fatalf("expected job-older to remain available, got %s", nextJobID)
+	}
+
+	var retrievalMode string
+	if err := testDB.QueryRow(
+		`SELECT input_data->>'retrieval_mode' FROM pgwf.jobs_trace WHERE tenant_id = $1 AND job_id = $2 AND event_type = 'job_retrieved' ORDER BY trace_id DESC LIMIT 1`,
+		defaultTenantID, "job-target",
+	).Scan(&retrievalMode); err != nil {
+		t.Fatalf("trace retrieval mode: %v", err)
+	}
+	if retrievalMode != "direct_job_id" {
+		t.Fatalf("expected direct_job_id retrieval mode, got %s", retrievalMode)
+	}
+}
+
+func TestGetJobLeaseRejectsUnavailableTargets(t *testing.T) {
+	t.Run("capability mismatch returns no row", func(t *testing.T) {
+		resetTables(t)
+
+		if _, err := testDB.Exec(
+			`SELECT pgwf.submit_job($1, $2, $3, $4)`,
+			defaultTenantID, "job-cap-mismatch", "submitter", "cap.targeted",
+		); err != nil {
+			t.Fatalf("submit_job: %v", err)
+		}
+
+		if hasRow(
+			t,
+			`SELECT 1 FROM pgwf.get_job_lease($1, $2, $3, $4, $5)`,
+			defaultTenantID, "job-cap-mismatch", "worker-targeted", pqStringArray([]string{"cap.other"}), 30,
+		) {
+			t.Fatalf("expected no lease when capabilities do not match")
+		}
+	})
+
+	t.Run("expired jobs do not lease", func(t *testing.T) {
+		resetTables(t)
+
+		expiredAt := time.Now().Add(-time.Minute)
+		if _, err := testDB.Exec(
+			`SELECT pgwf.submit_job($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+			defaultTenantID, "job-expired-targeted", "submitter", "cap.targeted", pqStringArray(nil), nil, nil, nil, nil, expiredAt,
+		); err != nil {
+			t.Fatalf("submit_job: %v", err)
+		}
+
+		if hasRow(
+			t,
+			`SELECT 1 FROM pgwf.get_job_lease($1, $2, $3, $4, $5)`,
+			defaultTenantID, "job-expired-targeted", "worker-targeted", pqStringArray([]string{"cap.targeted"}), 30,
+		) {
+			t.Fatalf("expected no lease for expired job")
+		}
+	})
+}
+
+func TestGetJobLeaseRespectsSingletons(t *testing.T) {
+	resetTables(t)
+
+	for _, jobID := range []string{"job-singleton-held", "job-singleton-blocked"} {
+		if _, err := testDB.Exec(
+			`SELECT pgwf.submit_job($1, $2, $3, $4, $5, $6, $7, $8)`,
+			defaultTenantID, jobID, "submitter", "cap.singleton.targeted", nil, nil, nil, "singleton-targeted",
+		); err != nil {
+			t.Fatalf("submit %s: %v", jobID, err)
+		}
+	}
+
+	var heldJobID, heldLeaseID string
+	if err := testDB.QueryRow(
+		`SELECT job_id, lease_id FROM pgwf.get_work($1, $2, $3, $4, $5)`,
+		"worker-held", pqStringArray([]string{"cap.singleton.targeted"}), nil, 30, 1,
+	).Scan(&heldJobID, &heldLeaseID); err != nil {
+		t.Fatalf("get_work held: %v", err)
+	}
+	if heldJobID != "job-singleton-held" {
+		t.Fatalf("expected job-singleton-held, got %s", heldJobID)
+	}
+
+	if hasRow(
+		t,
+		`SELECT 1 FROM pgwf.get_job_lease($1, $2, $3, $4, $5)`,
+		defaultTenantID, "job-singleton-blocked", "worker-targeted", pqStringArray([]string{"cap.singleton.targeted"}), 30,
+	) {
+		t.Fatalf("expected singleton-blocked job to remain unavailable")
+	}
+
+	if _, err := testDB.Exec(
+		`SELECT pgwf.complete_job($1, $2, $3, $4)`,
+		defaultTenantID, heldJobID, heldLeaseID, "worker-held",
+	); err != nil {
+		t.Fatalf("complete_job: %v", err)
+	}
+
+	var targetedJobID string
+	if err := testDB.QueryRow(
+		`SELECT job_id FROM pgwf.get_job_lease($1, $2, $3, $4, $5)`,
+		defaultTenantID, "job-singleton-blocked", "worker-targeted", pqStringArray([]string{"cap.singleton.targeted"}), 30,
+	).Scan(&targetedJobID); err != nil {
+		t.Fatalf("get_job_lease after singleton release: %v", err)
+	}
+	if targetedJobID != "job-singleton-blocked" {
+		t.Fatalf("expected job-singleton-blocked, got %s", targetedJobID)
+	}
+}
+
+func TestGetJobLeaseIncrementsExpirationCounters(t *testing.T) {
+	resetTables(t)
+
+	if _, err := testDB.Exec(
+		`SELECT pgwf.submit_job($1, $2, $3, $4)`,
+		defaultTenantID, "job-expiring-targeted", "submitter", "cap.expiring.targeted",
+	); err != nil {
+		t.Fatalf("submit_job: %v", err)
+	}
+
+	var firstLeaseID string
+	if err := testDB.QueryRow(
+		`SELECT lease_id FROM pgwf.get_job_lease($1, $2, $3, $4, $5)`,
+		defaultTenantID, "job-expiring-targeted", "worker-first", pqStringArray([]string{"cap.expiring.targeted"}), 30,
+	).Scan(&firstLeaseID); err != nil {
+		t.Fatalf("first get_job_lease: %v", err)
+	}
+
+	if _, err := testDB.Exec(
+		`UPDATE pgwf.jobs SET lease_expires_at = clock_timestamp() - interval '1 second' WHERE tenant_id = $1 AND job_id = $2`,
+		defaultTenantID, "job-expiring-targeted",
+	); err != nil {
+		t.Fatalf("expire lease: %v", err)
+	}
+
+	var secondLeaseID string
+	if err := testDB.QueryRow(
+		`SELECT lease_id FROM pgwf.get_job_lease($1, $2, $3, $4, $5)`,
+		defaultTenantID, "job-expiring-targeted", "worker-second", pqStringArray([]string{"cap.expiring.targeted"}), 30,
+	).Scan(&secondLeaseID); err != nil {
+		t.Fatalf("second get_job_lease: %v", err)
+	}
+	if secondLeaseID == "" || secondLeaseID == firstLeaseID {
+		t.Fatalf("expected a fresh lease id, got first=%s second=%s", firstLeaseID, secondLeaseID)
+	}
+
+	var expirationCount, consecutiveExpirations int
+	if err := testDB.QueryRow(
+		`SELECT lease_expiration_count, consecutive_expirations FROM pgwf.jobs WHERE tenant_id = $1 AND job_id = $2`,
+		defaultTenantID, "job-expiring-targeted",
+	).Scan(&expirationCount, &consecutiveExpirations); err != nil {
+		t.Fatalf("query counters: %v", err)
+	}
+	if expirationCount != 1 || consecutiveExpirations != 1 {
+		t.Fatalf("expected counters to increment to 1/1, got %d/%d", expirationCount, consecutiveExpirations)
+	}
+
+	var traceCount int
+	if err := testDB.QueryRow(
+		`SELECT count(*) FROM pgwf.jobs_trace WHERE tenant_id = $1 AND job_id = $2 AND event_type = 'lease_expiration_counter_incremented'`,
+		defaultTenantID, "job-expiring-targeted",
+	).Scan(&traceCount); err != nil {
+		t.Fatalf("query trace count: %v", err)
+	}
+	if traceCount != 1 {
+		t.Fatalf("expected one lease_expiration_counter_incremented trace, got %d", traceCount)
+	}
+}
+
 func TestPayloadRescheduleUpdates(t *testing.T) {
 	resetTables(t)
 
