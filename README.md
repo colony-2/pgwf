@@ -12,9 +12,9 @@ pgwf (Postgres Workflow) is a pure-SQL workflow engine. It's built specifically 
 
 | Function          | Description                                                                                                            | Signature                                                                                                                                   |
 |-------------------|------------------------------------------------------------------------------------------------------------------------|---------------------------------------------------------------------------------------------------------------------------------------------|
-| `submit_job` | Inserts a new job, validates dependencies, attaches an optional payload and metadata, and (optionally) emits notifications for `next_need`. | `submit_job(tenant_id TEXT, job_id TEXT, worker_id TEXT, next_need TEXT, wait_for TEXT[], payload JSONB, metadata JSONB, singleton_key TEXT, available_at TIMESTAMPTZ, expires_at TIMESTAMPTZ)` |
+| `submit_job` | Inserts a new job, validates dependencies, attaches an optional payload and metadata, and (optionally) emits notifications for `next_need`. | `submit_job(tenant_id TEXT, job_id TEXT, worker_id TEXT, next_need TEXT, wait_for TEXT[], payload JSONB, metadata JSONB, available_at TIMESTAMPTZ, expires_at TIMESTAMPTZ)` |
 | `get_work`        | Leases up to `limit_jobs` that match the supplied capabilities and optional tenant filter, assigning a fresh `lease_id` and visibility timeout.   | `get_work(worker_id TEXT, worker_caps TEXT[], tenant_ids TEXT[], lease_seconds INT, limit_jobs INT)`                                                           |
-| `get_job_lease`   | Attempts to lease one specific `(tenant_id, job_id)` when it is currently `READY`, capability-compatible, and not singleton-blocked. | `get_job_lease(tenant_id TEXT, job_id TEXT, worker_id TEXT, worker_caps TEXT[], lease_seconds INT)` |
+| `get_job_lease`   | Attempts to lease one specific `(tenant_id, job_id)` when it is currently `READY` and capability-compatible. | `get_job_lease(tenant_id TEXT, job_id TEXT, worker_id TEXT, worker_caps TEXT[], lease_seconds INT)` |
 | `extend_lease`    | Heartbeats an active lease by pushing `lease_expires_at` into the future.                                              | `extend_lease(tenant_id TEXT, job_id TEXT, lease_id TEXT, worker_id TEXT, additional_seconds INT)`                                                          |
 | `reschedule_job`  | Returns a leased job to the queue with updated capability/dependency metadata, optional payload override, and clears the lease. | `reschedule_job(tenant_id TEXT, job_id TEXT, lease_id TEXT, worker_id TEXT, next_need TEXT, wait_for TEXT[], available_at TIMESTAMPTZ, payload JSONB)` |
 | `reschedule_unheld_job` | Mutates any `READY` job's metadata/availability (including optional payload override) without first needing a lease.      | `reschedule_unheld_job(tenant_id TEXT, job_id TEXT, worker_id TEXT, next_need TEXT, wait_for TEXT[], available_at TIMESTAMPTZ, payload JSONB)`         |
@@ -28,8 +28,8 @@ pgwf (Postgres Workflow) is a pure-SQL workflow engine. It's built specifically 
 
 | Table | Columns (summary) | Purpose |
 |-------|-------------------|---------|
-| `jobs` | `tenant_id`, `job_id`, `next_need`, `wait_for[]`, `payload`, `metadata`, `singleton_key`, `available_at`, `expires_at`, `lease_id`, `lease_expires_at`, `lease_expiration_count`, `consecutive_expirations`, timestamps, cancellation metadata | Live job metadata for runnable/leased/delayed jobs plus crash-concern counters. Primary key: `(tenant_id, job_id)`. |
-| `jobs_archive` | `tenant_id`, `job_id`, `next_need`, `wait_for[]`, `payload`, `metadata`, `singleton_key`, `created_at`, `expires_at`, `lease_id`, `lease_expiration_count`, `consecutive_expirations`, `archived_at`, `completion_status`, `completion_detail`, cancellation metadata | Immutable snapshot for completed or cancelled jobs; prevents `job_id` reuse within same tenant. Primary key: `(tenant_id, job_id)`. |
+| `jobs` | `tenant_id`, `job_id`, `next_need`, `wait_for[]`, `payload`, `metadata`, `available_at`, `expires_at`, `lease_id`, `lease_expires_at`, `lease_expiration_count`, `consecutive_expirations`, timestamps, cancellation metadata | Live job metadata for runnable/leased/delayed jobs plus crash-concern counters. Primary key: `(tenant_id, job_id)`. |
+| `jobs_archive` | `tenant_id`, `job_id`, `next_need`, `wait_for[]`, `payload`, `metadata`, `created_at`, `expires_at`, `lease_id`, `lease_expiration_count`, `consecutive_expirations`, `archived_at`, `completion_status`, `completion_detail`, cancellation metadata | Immutable snapshot for completed or cancelled jobs; prevents `job_id` reuse within same tenant. Primary key: `(tenant_id, job_id)`. |
 | `jobs_trace` | `trace_id`, `tenant_id`, `job_id`, `event_type`, `worker_id`, `event_at`, `input_data`, `output_data` | Append-only audit log of every workflow call, scoped per tenant. |
 
 ### Views
@@ -77,7 +77,6 @@ pgwf supports multi-tenancy through a composite primary key `(tenant_id, job_id)
 ### Key Multi-Tenant Characteristics
 
 - **Tenant Isolation**: Jobs are scoped per tenant. Dependencies (`wait_for`) can only reference jobs within the same tenant, preventing cross-tenant leakage.
-- **Singleton Keys**: `singleton_key` constraints are scoped per tenant, allowing different tenants to have active jobs with the same key simultaneously.
 - **Worker Flexibility**: Workers can serve multiple tenants or be dedicated to specific tenants via the `tenant_ids` parameter in `get_work()`.
 - **Tenant Filtering**: Operations like `get_work()` and `archive_cancelled_jobs()` accept optional `tenant_ids TEXT[]` parameter:
   - `NULL` or `'{}'`: Operate across all tenants
@@ -138,7 +137,6 @@ FROM pgwf.get_work(
 - **Deterministic leasing** – Visibility timeouts plus explicit `lease_id`s guarantee only one worker owns a job at a time and that resumes are idempotent.
 - **Dependency-aware flow** – `wait_for` lets you fan out multiple child jobs, then automatically unblock the parent when all children finish.
 - **Capability routing** – Workers advertise capabilities (e.g., “python”, “human-review”), and jobs hop between phases by updating `next_need`.
-- **Singleton enforcement** – `singleton_key` ensures only one job for a logical entity (customer, invoice, run) can be leased simultaneously.
 - **Observable & traceable** – Every mutation writes to `pgwf.jobs_trace` so you can rebuild timelines or audit operator actions.
 - **Composable** – Functions can be called from stored procedures, application code, or CLI sessions.
 
@@ -182,11 +180,6 @@ SELECT pgwf.submit_job(
     p_alternate_after_seconds => 300  -- fall back after 5 minutes
 );
 ```
-
-### Singleton keys
-
-`singleton_key` is an optional mutex scope. If all “billing for customer-42” jobs share `singleton_key = 'customer-42'`, pgwf ensures only one job with that key holds a lease at any time. This prevents concurrent workflows from trampling shared resources without involving advisory locks or external coordination.
-The key is set (or left NULL) when the job is first submitted and remains immutable; reschedule helpers do not accept a singleton parameter.
 
 ### Wait-for semantics
 
@@ -259,7 +252,7 @@ If the transaction commits, both the invoice row and the workflow job become dur
 ```
 
 1. **Producer writes payload** – The producer persists the workflow input in journal, receiving a deterministic `job_id`.
-2. **Submit job** – The producer calls `pgwf.submit_job(job_id, worker_id, next_need, wait_for, metadata, singleton_key, available_at)` to register the work. Example:
+2. **Submit job** – The producer calls `pgwf.submit_job(job_id, worker_id, next_need, wait_for, metadata, available_at)` to register the work. Example:
 
     ```sql
     SELECT tenant_id, job_id
@@ -270,11 +263,9 @@ If the transaction commits, both the invoice row and the workflow job become dur
         p_next_need     => 'transcode.video',
         p_wait_for      => ARRAY['preflight-99'],
         p_metadata      => '{"source":"journal"}'::JSONB,
-        p_singleton_key => 'video-777',
         p_available_at  => clock_timestamp()
     );
     ```
-   The singleton key (if any) is fixed at submission time; subsequent reschedules do not accept or alter it.
 
 3. **Workers poll** – Workers call `pgwf.get_work(worker_id, worker_caps, tenant_ids, lease_seconds, limit_jobs)` to lease jobs. When notifications are enabled they also `LISTEN pgwf.need.<capability>` to wake up instantly; otherwise they simply poll. Each lease returns full metadata plus a fresh `lease_id`. A "python" worker might perform ETL, while a "human-review" worker handles compliance later.
 4. **Process + heartbeat** – While running, workers use `pgwf.extend_lease(tenant_id, job_id, lease_id, worker_id, additional_seconds)` to keep ownership. If they expect a long pause, they can reschedule themselves with a future `available_at`.

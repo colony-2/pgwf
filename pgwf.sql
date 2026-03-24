@@ -17,7 +17,6 @@ CREATE TABLE IF NOT EXISTS pgwf.jobs (
     wait_for TEXT[] NOT NULL DEFAULT '{}'::TEXT[],
     payload JSONB NOT NULL DEFAULT '{}'::JSONB,
     metadata JSONB NOT NULL DEFAULT '{}'::JSONB,
-    singleton_key TEXT,
     available_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
     expires_at TIMESTAMPTZ NOT NULL DEFAULT 'infinity',
     lease_id TEXT,
@@ -87,7 +86,6 @@ CREATE TABLE IF NOT EXISTS pgwf.jobs_archive (
     wait_for TEXT[] NOT NULL DEFAULT '{}'::TEXT[],
     payload JSONB NOT NULL DEFAULT '{}'::JSONB,
     metadata JSONB NOT NULL DEFAULT '{}'::JSONB,
-    singleton_key TEXT,
     created_at TIMESTAMPTZ NOT NULL,
     expires_at TIMESTAMPTZ NOT NULL DEFAULT 'infinity',
     lease_id TEXT,
@@ -240,10 +238,6 @@ CREATE INDEX IF NOT EXISTS idx_jobs_tenant_ready_work
 ON pgwf.jobs(tenant_id, next_need, created_at)
 WHERE NOT cancel_requested;
 
-CREATE INDEX IF NOT EXISTS idx_jobs_tenant_active_singleton
-ON pgwf.jobs(tenant_id, singleton_key)
-WHERE singleton_key IS NOT NULL;
-
 CREATE INDEX IF NOT EXISTS idx_jobs_tenant_waitfor
 ON pgwf.jobs(tenant_id, job_id)
 INCLUDE (wait_for);
@@ -260,6 +254,15 @@ ON pgwf.jobs_archive USING GIN (metadata);
 
 CREATE INDEX IF NOT EXISTS idx_trace_tenant_job_event
 ON pgwf.jobs_trace(tenant_id, job_id, event_at DESC);
+
+DROP VIEW IF EXISTS pgwf.jobs_friendly_status;
+DROP VIEW IF EXISTS pgwf.jobs_with_status CASCADE;
+DROP FUNCTION IF EXISTS pgwf.submit_job(TEXT, TEXT, TEXT, TEXT, TEXT[], JSONB, JSONB, TEXT, TIMESTAMPTZ, TIMESTAMPTZ, TEXT, INTEGER);
+DROP FUNCTION IF EXISTS pgwf.get_work(TEXT, TEXT[], TEXT[], INTEGER, INTEGER, TEXT[], TEXT[]);
+DROP FUNCTION IF EXISTS pgwf.get_job_lease(TEXT, TEXT, TEXT, TEXT[], INTEGER);
+DROP INDEX IF EXISTS pgwf.idx_jobs_tenant_active_singleton;
+ALTER TABLE pgwf.jobs DROP COLUMN IF EXISTS singleton_key;
+ALTER TABLE pgwf.jobs_archive DROP COLUMN IF EXISTS singleton_key;
 
 CREATE OR REPLACE FUNCTION pgwf.crash_concern_threshold()
 RETURNS INTEGER
@@ -510,7 +513,6 @@ BEGIN
         wait_for,
         payload,
         metadata,
-        singleton_key,
         created_at,
         expires_at,
         lease_id,
@@ -531,7 +533,6 @@ BEGIN
         p_locked_job.wait_for,
         p_locked_job.payload,
         p_locked_job.metadata,
-        p_locked_job.singleton_key,
         p_locked_job.created_at,
         p_locked_job.expires_at,
         p_locked_job.lease_id,
@@ -820,7 +821,6 @@ CREATE OR REPLACE FUNCTION pgwf.submit_job(
     p_wait_for TEXT[] DEFAULT '{}'::TEXT[],
     p_payload JSONB DEFAULT '{}'::JSONB,
     p_metadata JSONB DEFAULT '{}'::JSONB,
-    p_singleton_key TEXT DEFAULT NULL,
     p_available_at TIMESTAMPTZ DEFAULT clock_timestamp(),
     p_expires_at TIMESTAMPTZ DEFAULT NULL,
     p_alternate_next_need TEXT DEFAULT NULL,
@@ -877,7 +877,6 @@ BEGIN
         wait_for,
         payload,
         metadata,
-        singleton_key,
         available_at,
         expires_at
     )
@@ -890,7 +889,6 @@ BEGIN
         v_wait_for,
         v_payload,
         v_metadata,
-        p_singleton_key,
         v_effective_available,
         v_expires_at
     )
@@ -919,7 +917,6 @@ BEGIN
             'worker_id', p_worker_id,
             'next_need', p_next_need,
             'wait_for', v_wait_for,
-            'singleton_key', p_singleton_key,
             'available_at', v_effective_available,
             'expires_at', v_expires_at,
             'alternate_next_need', p_alternate_next_need,
@@ -1103,7 +1100,6 @@ RETURNS TABLE(
     job_id TEXT,
     lease_id TEXT,
     next_need TEXT,
-    singleton_key TEXT,
     wait_for TEXT[],
     payload JSONB,
     available_at TIMESTAMPTZ,
@@ -1175,15 +1171,6 @@ BEGIN
     END LOOP;
 
     v_sql := v_sql || $sql$
-              AND (
-                  jws.singleton_key IS NULL OR NOT EXISTS (
-                      SELECT 1
-                      FROM pgwf.jobs_with_status other
-                      WHERE other.tenant_id = jws.tenant_id
-                        AND other.singleton_key = jws.singleton_key
-                        AND other.status = 'ACTIVE'
-                  )
-              )
             ORDER BY jws.created_at ASC
             LIMIT $4
             FOR UPDATE SKIP LOCKED
@@ -1207,7 +1194,6 @@ BEGIN
                   j.job_id,
                   j.lease_id,
                   c.effective_next_need,
-                  j.singleton_key,
                   j.wait_for,
                   j.payload,
                   j.available_at,
@@ -1224,7 +1210,7 @@ BEGIN
                   c.ready_since
     $sql$;
 
-    FOR v_tenant_id, job_id, lease_id, next_need, singleton_key, wait_for, payload, available_at, lease_expires_at,
+    FOR v_tenant_id, job_id, lease_id, next_need, wait_for, payload, available_at, lease_expires_at,
         v_previous_lease_id, v_previous_lease_expires_at, v_previous_lease_expired,
         v_total_expirations, v_consecutive_expirations, v_stored_next_need, v_pivoted,
         v_alternate_next_need, v_alternate_after_seconds, v_ready_since IN
@@ -1302,7 +1288,6 @@ RETURNS TABLE(
     job_id TEXT,
     lease_id TEXT,
     next_need TEXT,
-    singleton_key TEXT,
     wait_for TEXT[],
     payload JSONB,
     available_at TIMESTAMPTZ,
@@ -1348,7 +1333,7 @@ BEGIN
 
     v_expires := v_now + make_interval(secs => p_lease_seconds);
 
-    FOR v_tenant_id, job_id, lease_id, next_need, singleton_key, wait_for, payload, available_at, lease_expires_at,
+    FOR v_tenant_id, job_id, lease_id, next_need, wait_for, payload, available_at, lease_expires_at,
         v_previous_lease_id, v_previous_lease_expires_at, v_previous_lease_expired,
         v_total_expirations, v_consecutive_expirations, v_stored_next_need, v_pivoted,
         v_alternate_next_need, v_alternate_after_seconds, v_ready_since IN
@@ -1360,15 +1345,6 @@ BEGIN
               AND jws.job_id = p_job_id
               AND jws.status = 'READY'
               AND jws.effective_next_need = ANY(v_caps)
-              AND (
-                  jws.singleton_key IS NULL OR NOT EXISTS (
-                      SELECT 1
-                      FROM pgwf.jobs_with_status other
-                      WHERE other.tenant_id = jws.tenant_id
-                        AND other.singleton_key = jws.singleton_key
-                        AND other.status = 'ACTIVE'
-                  )
-              )
             FOR UPDATE SKIP LOCKED
         )
         UPDATE pgwf.jobs j
@@ -1390,7 +1366,6 @@ BEGIN
                   j.job_id,
                   j.lease_id,
                   c.effective_next_need,
-                  j.singleton_key,
                   j.wait_for,
                   j.payload,
                   j.available_at,
@@ -1739,7 +1714,6 @@ BEGIN
             wait_for,
             payload,
             metadata,
-            singleton_key,
             created_at,
             expires_at,
             lease_id,
@@ -1760,7 +1734,6 @@ BEGIN
             j.wait_for,
             j.payload,
             j.metadata,
-            j.singleton_key,
             j.created_at,
             j.expires_at,
             j.lease_id,
